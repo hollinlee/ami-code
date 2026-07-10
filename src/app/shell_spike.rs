@@ -9,12 +9,10 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::backend::{BackendSpec, NvimBackend, PiBackend, ShellBackend};
 use crate::terminal::{ProcessSpec, TerminalSession, TerminalSize};
+use crate::ui::{TerminalPaneStyle, render_terminal_pane, terminal_content_size};
 use crate::workspace::Workspace;
 
 pub fn run() -> Result<()> {
@@ -38,7 +36,7 @@ fn run_backend(backend: impl BackendSpec) -> Result<()> {
 fn run_session(spec: &ProcessSpec) -> Result<()> {
     let mut terminal_guard = TerminalGuard::enter()?;
     let size = terminal_guard.terminal.size()?;
-    let terminal_size = inner_terminal_size_value(size.width, size.height);
+    let terminal_size = terminal_content_size(size.into());
     let mut session = TerminalSession::spawn(spec, terminal_size, 1_000)?;
 
     loop {
@@ -48,15 +46,17 @@ fn run_session(spec: &ProcessSpec) -> Result<()> {
         }
 
         let size = terminal_guard.terminal.size()?;
-        session.resize(inner_terminal_size_value(size.width, size.height))?;
+        session.resize(terminal_content_size(size.into()))?;
 
         terminal_guard.terminal.draw(|frame| {
-            render_pty(
-                frame.area(),
+            let title = format!("ami-code {} spike — Ctrl+Q to quit", session.display_name());
+            render_terminal_pane(
                 frame,
-                session.parser(),
-                session.display_name(),
+                frame.area(),
+                session.screen(),
+                &title,
                 true,
+                TerminalPaneStyle::default(),
             );
         })?;
 
@@ -65,7 +65,7 @@ fn run_session(spec: &ProcessSpec) -> Result<()> {
                 Event::Key(key) if is_quit(key) => break,
                 Event::Key(key) => session.send_key(key)?,
                 Event::Resize(cols, rows) => {
-                    session.resize(inner_terminal_size_value(cols, rows))?;
+                    session.resize(terminal_content_size(Rect::new(0, 0, cols, rows)))?;
                 }
                 _ => {}
             }
@@ -74,147 +74,6 @@ fn run_session(spec: &ProcessSpec) -> Result<()> {
 
     session.terminate();
     Ok(())
-}
-
-pub(super) fn inner_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
-    let size = inner_terminal_size_value(cols, rows);
-    (size.cols, size.rows)
-}
-
-fn inner_terminal_size_value(cols: u16, rows: u16) -> TerminalSize {
-    TerminalSize::new(cols.saturating_sub(2), rows.saturating_sub(2))
-}
-
-pub(super) fn render_pty(
-    area: Rect,
-    frame: &mut ratatui::Frame<'_>,
-    parser: &vt100::Parser,
-    title: &str,
-    focused: bool,
-) {
-    let lines = styled_screen_lines(parser);
-
-    let block = Block::default()
-        .title(format!("ami-code {title} spike — Ctrl+Q to quit"))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused {
-            Color::LightYellow
-        } else {
-            Color::Cyan
-        }));
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn styled_screen_lines(parser: &vt100::Parser) -> Vec<Line<'static>> {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let cursor = screen.cursor_position();
-    let mut lines = Vec::with_capacity(rows as usize);
-
-    for row in 0..rows {
-        let mut spans = Vec::with_capacity(cols as usize);
-        for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                spans.push(Span::raw(" "));
-                continue;
-            };
-
-            if cell.is_wide_continuation() {
-                continue;
-            }
-
-            let contents = if cell.has_contents() {
-                cell.contents().to_string()
-            } else {
-                " ".to_string()
-            };
-            spans.push(Span::styled(
-                contents,
-                cell_style(cell, cursor == (row, col)),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    lines
-}
-
-fn cell_style(cell: &vt100::Cell, is_cursor: bool) -> Style {
-    let mut fg = color_to_ratatui(cell.fgcolor());
-    let mut bg = color_to_ratatui(cell.bgcolor());
-
-    if cell.inverse() {
-        match (fg, bg) {
-            (None, None) => {
-                fg = Some(Color::Black);
-                bg = Some(Color::White);
-            }
-            _ => std::mem::swap(&mut fg, &mut bg),
-        }
-    }
-
-    if is_cursor {
-        match (fg, bg) {
-            (None, None) => {
-                fg = Some(Color::Black);
-                bg = Some(Color::LightYellow);
-            }
-            _ => std::mem::swap(&mut fg, &mut bg),
-        }
-    }
-
-    let mut style = Style::default();
-    if let Some(color) = fg {
-        style = style.fg(color);
-    }
-    if let Some(color) = bg {
-        style = style.bg(color);
-    }
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if cell.dim() {
-        style = style.add_modifier(Modifier::DIM);
-    }
-
-    style
-}
-
-fn color_to_ratatui(color: vt100::Color) -> Option<Color> {
-    match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(idx) => Some(indexed_color(idx)),
-        vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
-    }
-}
-
-fn indexed_color(idx: u8) -> Color {
-    match idx {
-        0 => Color::Black,
-        1 => Color::Red,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        4 => Color::Blue,
-        5 => Color::Magenta,
-        6 => Color::Cyan,
-        7 => Color::Gray,
-        8 => Color::DarkGray,
-        9 => Color::LightRed,
-        10 => Color::LightGreen,
-        11 => Color::LightYellow,
-        12 => Color::LightBlue,
-        13 => Color::LightMagenta,
-        14 => Color::LightCyan,
-        15 => Color::White,
-        value => Color::Indexed(value),
-    }
 }
 
 pub(super) fn terminal_query_responses(bytes: &[u8], parser: &vt100::Parser) -> Vec<String> {
