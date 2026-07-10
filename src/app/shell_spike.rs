@@ -36,7 +36,7 @@ fn run_shell_session() -> Result<()> {
         .display_name("shell")
         .env("TERM", "xterm-256color")
         .cwd(std::env::current_dir()?);
-    let mut session = TerminalSession::spawn(spec, terminal_size, 1_000)?;
+    let mut session = TerminalSession::spawn(&spec, terminal_size, 1_000)?;
 
     loop {
         session.poll_output()?;

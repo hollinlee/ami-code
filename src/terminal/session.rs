@@ -12,9 +12,9 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub fn spawn(spec: ProcessSpec, size: TerminalSize, scrollback_len: usize) -> Result<Self> {
+    pub fn spawn(spec: &ProcessSpec, size: TerminalSize, scrollback_len: usize) -> Result<Self> {
         let display_name = spec.display_name.clone();
-        let process = PtyProcess::spawn(&spec, size)?;
+        let process = PtyProcess::spawn(spec, size)?;
         let parser = vt100::Parser::new(size.rows, size.cols, scrollback_len);
 
         Ok(Self {
