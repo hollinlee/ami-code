@@ -3,18 +3,23 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::layout::Rect;
 
 use super::shell_spike::{
     EmbeddedCommand, PtyProcess, TerminalGuard, is_quit, key_to_pty_bytes, terminal_query_responses,
 };
-use crate::ui::{TerminalPaneStyle, render_terminal_pane, terminal_content_size};
+use crate::ui::{
+    SidebarStyle, TerminalPaneStyle, render_sidebar, render_terminal_pane, terminal_content_size,
+};
+use crate::workbench::{
+    Direction, Mode, PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState,
+};
 
 pub fn run() -> Result<()> {
     let mut terminal_guard = TerminalGuard::enter()?;
-    let mut layout = WorkbenchLayout::calculate(terminal_guard.terminal.size()?.into());
+    let layout_config = WorkbenchLayoutConfig::default();
+    let mut layout =
+        WorkbenchLayout::calculate(terminal_guard.terminal.size()?.into(), layout_config);
 
     let mut panes = HashMap::new();
     panes.insert(
@@ -30,8 +35,7 @@ pub fn run() -> Result<()> {
         PtyPane::spawn(EmbeddedCommand::Shell, layout.bottom)?,
     );
 
-    let mut focused = PaneId::Editor;
-    let mut mode = Mode::Edit;
+    let mut workbench = WorkbenchState::default();
 
     loop {
         for pane in panes.values_mut() {
@@ -45,7 +49,7 @@ pub fn run() -> Result<()> {
             break;
         }
 
-        layout = WorkbenchLayout::calculate(terminal_guard.terminal.size()?.into());
+        layout = WorkbenchLayout::calculate(terminal_guard.terminal.size()?.into(), layout_config);
         for (id, area) in [
             (PaneId::Editor, layout.editor),
             (PaneId::Agent, layout.agent),
@@ -57,7 +61,13 @@ pub fn run() -> Result<()> {
         }
 
         terminal_guard.terminal.draw(|frame| {
-            render_sidebar(layout.sidebar, frame, focused == PaneId::Sidebar, mode);
+            render_sidebar(
+                frame,
+                layout.sidebar,
+                workbench.is_focused(PaneId::Sidebar),
+                workbench.mode(),
+                SidebarStyle::default(),
+            );
             for (id, area) in [
                 (PaneId::Editor, layout.editor),
                 (PaneId::Agent, layout.agent),
@@ -70,7 +80,7 @@ pub fn run() -> Result<()> {
                         area,
                         pane.parser.screen(),
                         &title,
-                        focused == id,
+                        workbench.is_focused(id),
                         TerminalPaneStyle::default(),
                     );
                 }
@@ -80,18 +90,7 @@ pub fn run() -> Result<()> {
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) if is_quit(key) => break,
-                Event::Key(key) if handle_global_focus_key(key, &mut focused) => {}
-                Event::Key(key) if is_control_toggle(key) => mode = mode.toggle_control(),
-                Event::Key(key) => match mode {
-                    Mode::Control => handle_control_key(key, &mut focused, &mut mode),
-                    Mode::Edit => {
-                        if let Some(pane) = panes.get_mut(&focused) {
-                            if let Some(bytes) = key_to_pty_bytes(key) {
-                                pane.pty.write_all(&bytes)?;
-                            }
-                        }
-                    }
-                },
+                Event::Key(key) => handle_key(key, &mut workbench, &mut panes)?,
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -105,25 +104,64 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PaneId {
-    Sidebar,
-    Editor,
-    Agent,
-    Bottom,
+fn handle_key(
+    key: KeyEvent,
+    workbench: &mut WorkbenchState,
+    panes: &mut HashMap<PaneId, PtyPane>,
+) -> Result<()> {
+    if let Some(direction) = global_focus_direction(key) {
+        workbench.focus(direction);
+        return Ok(());
+    }
+
+    if is_control_toggle(key) {
+        workbench.toggle_control_mode();
+        return Ok(());
+    }
+
+    match workbench.mode() {
+        Mode::Edit => {
+            if let Some(pane) = panes.get_mut(&workbench.focused_pane())
+                && let Some(bytes) = key_to_pty_bytes(key)
+            {
+                pane.pty.write_all(&bytes)?;
+            }
+        }
+        Mode::Control | Mode::View => handle_workbench_key(key, workbench),
+    }
+
+    Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Edit,
-    Control,
+fn global_focus_direction(key: KeyEvent) -> Option<Direction> {
+    key.modifiers
+        .contains(KeyModifiers::CONTROL)
+        .then(|| direction_for_key(key.code))
+        .flatten()
 }
 
-impl Mode {
-    fn toggle_control(self) -> Self {
-        match self {
-            Self::Edit => Self::Control,
-            Self::Control => Self::Edit,
+fn direction_for_key(code: KeyCode) -> Option<Direction> {
+    match code {
+        KeyCode::Char('h') => Some(Direction::Left),
+        KeyCode::Char('j') => Some(Direction::Down),
+        KeyCode::Char('k') => Some(Direction::Up),
+        KeyCode::Char('l') => Some(Direction::Right),
+        _ => None,
+    }
+}
+
+fn is_control_toggle(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
+        || key.code == KeyCode::Null
+}
+
+fn handle_workbench_key(key: KeyEvent, workbench: &mut WorkbenchState) {
+    match key.code {
+        KeyCode::Esc => workbench.set_mode(Mode::Edit),
+        code => {
+            if let Some(direction) = direction_for_key(code) {
+                workbench.focus(direction);
+            }
         }
     }
 }
@@ -167,114 +205,19 @@ impl PtyPane {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct WorkbenchLayout {
-    sidebar: Rect,
-    editor: Rect,
-    agent: Rect,
-    bottom: Rect,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl WorkbenchLayout {
-    fn calculate(area: Rect) -> Self {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(24),
-                Constraint::Min(20),
-                Constraint::Length(40),
-            ])
-            .split(area);
-
-        let middle = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(12)])
-            .split(columns[1]);
-
-        Self {
-            sidebar: columns[0],
-            editor: middle[0],
-            bottom: middle[1],
-            agent: columns[2],
-        }
-    }
-}
-
-fn render_sidebar(area: Rect, frame: &mut ratatui::Frame<'_>, focused: bool, mode: Mode) {
-    let border = if focused {
-        Color::LightYellow
-    } else {
-        Color::DarkGray
-    };
-    let text = format!(
-        "dummy sidebar\n\nmode: {:?}\n\nCtrl+h/j/k/l focus\nCtrl+Space control\nCtrl+Q quit",
-        mode
-    );
-    let block = Block::default()
-        .title("sidebar")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
-    frame.render_widget(Paragraph::new(text).block(block), area);
-}
-
-fn is_control_toggle(key: KeyEvent) -> bool {
-    (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
-        || key.code == KeyCode::Null
-}
-
-fn handle_global_focus_key(key: KeyEvent, focused: &mut PaneId) -> bool {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-        return false;
-    }
-
-    match key.code {
-        KeyCode::Char('h') => *focused = focus_left(*focused),
-        KeyCode::Char('j') => *focused = focus_down(*focused),
-        KeyCode::Char('k') => *focused = focus_up(*focused),
-        KeyCode::Char('l') => *focused = focus_right(*focused),
-        _ => return false,
-    }
-
-    true
-}
-
-fn handle_control_key(key: KeyEvent, focused: &mut PaneId, mode: &mut Mode) {
-    match key.code {
-        KeyCode::Esc => *mode = Mode::Edit,
-        KeyCode::Char('h') => *focused = focus_left(*focused),
-        KeyCode::Char('j') => *focused = focus_down(*focused),
-        KeyCode::Char('k') => *focused = focus_up(*focused),
-        KeyCode::Char('l') => *focused = focus_right(*focused),
-        _ => {}
-    }
-}
-
-fn focus_left(current: PaneId) -> PaneId {
-    match current {
-        PaneId::Editor => PaneId::Sidebar,
-        PaneId::Agent => PaneId::Editor,
-        other => other,
-    }
-}
-
-fn focus_right(current: PaneId) -> PaneId {
-    match current {
-        PaneId::Sidebar => PaneId::Editor,
-        PaneId::Editor => PaneId::Agent,
-        other => other,
-    }
-}
-
-fn focus_down(current: PaneId) -> PaneId {
-    match current {
-        PaneId::Editor => PaneId::Bottom,
-        other => other,
-    }
-}
-
-fn focus_up(current: PaneId) -> PaneId {
-    match current {
-        PaneId::Bottom => PaneId::Editor,
-        other => other,
+    #[test]
+    fn maps_vim_direction_keys() {
+        assert_eq!(direction_for_key(KeyCode::Char('h')), Some(Direction::Left));
+        assert_eq!(direction_for_key(KeyCode::Char('j')), Some(Direction::Down));
+        assert_eq!(direction_for_key(KeyCode::Char('k')), Some(Direction::Up));
+        assert_eq!(
+            direction_for_key(KeyCode::Char('l')),
+            Some(Direction::Right)
+        );
+        assert_eq!(direction_for_key(KeyCode::Char('x')), None);
     }
 }
