@@ -60,8 +60,8 @@ impl TerminalSession {
     pub fn resize(&mut self, size: TerminalSize) -> Result<()> {
         let (rows, cols) = self.parser.screen().size();
         if rows != size.rows || cols != size.cols {
-            self.parser.screen_mut().set_size(size.rows, size.cols);
             self.process.resize(size)?;
+            self.parser.screen_mut().set_size(size.rows, size.cols);
         }
         Ok(())
     }
