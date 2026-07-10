@@ -59,10 +59,6 @@ impl WorkbenchState {
     pub fn pane(&self, id: PaneId) -> Option<&PaneState> {
         self.panes.iter().find(|pane| pane.id == id)
     }
-
-    pub fn panes(&self) -> &[PaneState] {
-        &self.panes
-    }
 }
 
 #[cfg(test)]
@@ -75,7 +71,10 @@ mod tests {
 
         assert_eq!(state.mode(), Mode::Edit);
         assert_eq!(state.focused_pane(), PaneId::Editor);
-        assert_eq!(state.panes().len(), 4);
+        assert!(state.pane(PaneId::Sidebar).is_some());
+        assert!(state.pane(PaneId::Editor).is_some());
+        assert!(state.pane(PaneId::Agent).is_some());
+        assert!(state.pane(PaneId::Bottom).is_some());
     }
 
     #[test]

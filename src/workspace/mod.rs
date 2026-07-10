@@ -1,9 +1,3 @@
-mod config;
-mod session;
-
-pub use config::WorkspaceConfig;
-pub use session::WorkspaceSession;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
