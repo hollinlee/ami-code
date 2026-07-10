@@ -1,6 +1,3 @@
-use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,7 +6,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -17,8 +13,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::terminal::{ProcessSpec, TerminalSession, TerminalSize};
+
 pub fn run() -> Result<()> {
-    run_command(EmbeddedCommand::Shell)
+    run_shell_session()
 }
 
 pub fn run_nvim() -> Result<()> {
@@ -27,6 +25,52 @@ pub fn run_nvim() -> Result<()> {
 
 pub fn run_pi() -> Result<()> {
     run_command(EmbeddedCommand::Pi)
+}
+
+fn run_shell_session() -> Result<()> {
+    let mut terminal_guard = TerminalGuard::enter()?;
+    let size = terminal_guard.terminal.size()?;
+    let terminal_size = inner_terminal_size_value(size.width, size.height);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let spec = ProcessSpec::new(shell)
+        .display_name("shell")
+        .env("TERM", "xterm-256color")
+        .cwd(std::env::current_dir()?);
+    let mut session = TerminalSession::spawn(&spec, terminal_size, 1_000)?;
+
+    loop {
+        session.poll_output()?;
+        if session.has_exited()? {
+            break;
+        }
+
+        let size = terminal_guard.terminal.size()?;
+        session.resize(inner_terminal_size_value(size.width, size.height))?;
+
+        terminal_guard.terminal.draw(|frame| {
+            render_pty(
+                frame.area(),
+                frame,
+                session.parser(),
+                session.display_name(),
+                true,
+            );
+        })?;
+
+        if event::poll(Duration::from_millis(16))? {
+            match event::read()? {
+                Event::Key(key) if is_quit(key) => break,
+                Event::Key(key) => session.send_key(key)?,
+                Event::Resize(cols, rows) => {
+                    session.resize(inner_terminal_size_value(cols, rows))?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    session.terminate();
+    Ok(())
 }
 
 fn run_command(command: EmbeddedCommand) -> Result<()> {
@@ -84,7 +128,12 @@ fn run_command(command: EmbeddedCommand) -> Result<()> {
 }
 
 pub(super) fn inner_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
-    (cols.saturating_sub(2).max(1), rows.saturating_sub(2).max(1))
+    let size = inner_terminal_size_value(cols, rows);
+    (size.cols, size.rows)
+}
+
+fn inner_terminal_size_value(cols: u16, rows: u16) -> TerminalSize {
+    TerminalSize::new(cols.saturating_sub(2), rows.saturating_sub(2))
 }
 
 pub(super) fn render_pty(
@@ -220,34 +269,7 @@ fn indexed_color(idx: u8) -> Color {
 }
 
 pub(super) fn terminal_query_responses(bytes: &[u8], parser: &vt100::Parser) -> Vec<String> {
-    let mut responses = Vec::new();
-
-    if contains_sequence(bytes, b"\x1b[6n") {
-        let (row, col) = parser.screen().cursor_position();
-        responses.push(format!(
-            "\x1b[{};{}R",
-            row.saturating_add(1),
-            col.saturating_add(1)
-        ));
-    }
-
-    if contains_sequence(bytes, b"\x1b[5n") {
-        responses.push("\x1b[0n".to_string());
-    }
-
-    if contains_sequence(bytes, b"\x1b[c") || contains_sequence(bytes, b"\x1b[0c") {
-        responses.push("\x1b[?1;2c".to_string());
-    }
-
-    if contains_sequence(bytes, b"\x1b[>c") || contains_sequence(bytes, b"\x1b[>0c") {
-        responses.push("\x1b[>0;0;0c".to_string());
-    }
-
-    responses
-}
-
-fn contains_sequence(bytes: &[u8], needle: &[u8]) -> bool {
-    bytes.windows(needle.len()).any(|window| window == needle)
+    crate::terminal::query_responses(bytes, parser)
 }
 
 pub(super) fn is_quit(key: KeyEvent) -> bool {
@@ -255,36 +277,7 @@ pub(super) fn is_quit(key: KeyEvent) -> bool {
 }
 
 pub(super) fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    match key.code {
-        KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                ctrl_char(c).map(|byte| vec![byte])
-            } else {
-                Some(c.to_string().into_bytes())
-            }
-        }
-        KeyCode::Enter => Some(b"\r".to_vec()),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Tab => Some(b"\t".to_vec()),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        _ => None,
-    }
-}
-
-fn ctrl_char(c: char) -> Option<u8> {
-    let lower = c.to_ascii_lowercase();
-    if lower.is_ascii_lowercase() {
-        Some((lower as u8) - b'a' + 1)
-    } else {
-        None
-    }
+    crate::terminal::encode_key(key)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,76 +296,30 @@ impl EmbeddedCommand {
         }
     }
 
-    fn command(self) -> String {
-        match self {
+    fn process_spec(self) -> Result<ProcessSpec> {
+        let program = match self {
             Self::Shell => std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
             Self::Nvim => "nvim".to_string(),
             Self::Pi => "pi".to_string(),
-        }
+        };
+
+        Ok(ProcessSpec::new(program)
+            .display_name(self.title())
+            .env("TERM", "xterm-256color")
+            .cwd(std::env::current_dir()?))
     }
 }
 
 pub(super) struct PtyProcess {
     command: EmbeddedCommand,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send>,
-    rx: Receiver<Vec<u8>>,
+    process: crate::terminal::PtyProcess,
 }
 
 impl PtyProcess {
     pub(super) fn spawn(command: EmbeddedCommand, cols: u16, rows: u16) -> Result<Self> {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to open PTY")?;
-
-        let mut builder = CommandBuilder::new(command.command());
-        builder.env("TERM", "xterm-256color");
-
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .with_context(|| format!("failed to spawn {}", command.title()))?;
-        drop(pair.slave);
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
-
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buffer[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(Self {
-            command,
-            master: pair.master,
-            writer,
-            child,
-            rx,
-        })
+        let spec = command.process_spec()?;
+        let process = crate::terminal::PtyProcess::spawn(&spec, TerminalSize::new(cols, rows))?;
+        Ok(Self { command, process })
     }
 
     pub(super) fn title(&self) -> &'static str {
@@ -380,39 +327,23 @@ impl PtyProcess {
     }
 
     pub(super) fn drain_output(&self) -> Vec<Vec<u8>> {
-        let mut chunks = Vec::new();
-        while let Ok(bytes) = self.rx.try_recv() {
-            chunks.push(bytes);
-        }
-        chunks
+        self.process.drain_output()
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer
-            .write_all(bytes)
-            .context("failed to write to PTY")
+        self.process.write_all(bytes)
     }
 
     pub(super) fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        self.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to resize PTY")
+        self.process.resize(TerminalSize::new(cols, rows))
     }
 
     pub(super) fn has_exited(&mut self) -> Result<bool> {
-        self.child
-            .try_wait()
-            .map(|status| status.is_some())
-            .context("failed to poll PTY child")
+        self.process.has_exited()
     }
 
     pub(super) fn kill(&mut self) {
-        let _ = self.child.kill();
+        self.process.terminate();
     }
 }
 
