@@ -1,24 +1,48 @@
-use super::{Backend, BackendKind};
+use super::{BackendKind, BackendSpec, process_spec};
+use crate::terminal::ProcessSpec;
+use crate::workspace::Workspace;
 
 #[derive(Debug, Clone)]
 pub struct ShellBackend {
-    name: String,
+    program: String,
 }
 
 impl ShellBackend {
     pub fn system_default() -> Self {
         Self {
-            name: std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
+            program: std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
         }
     }
 }
 
-impl Backend for ShellBackend {
+impl BackendSpec for ShellBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Shell
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn display_name(&self) -> &str {
+        "shell"
+    }
+
+    fn process_spec(&self, workspace: &Workspace) -> ProcessSpec {
+        process_spec(&self.program, self.display_name(), workspace)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_spec_uses_workspace_root() {
+        let workspace = Workspace::discover(std::env::current_dir().unwrap()).unwrap();
+        let spec = ShellBackend::system_default().process_spec(&workspace);
+
+        assert_eq!(spec.cwd.as_deref(), Some(workspace.root()));
+        assert_eq!(spec.display_name, "shell");
+        assert_eq!(
+            spec.env.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
     }
 }

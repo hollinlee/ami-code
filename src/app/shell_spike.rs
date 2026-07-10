@@ -13,30 +13,33 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::backend::{BackendSpec, NvimBackend, PiBackend, ShellBackend};
 use crate::terminal::{ProcessSpec, TerminalSession, TerminalSize};
+use crate::workspace::Workspace;
 
 pub fn run() -> Result<()> {
-    run_shell_session()
+    run_backend(ShellBackend::system_default())
 }
 
 pub fn run_nvim() -> Result<()> {
-    run_command(EmbeddedCommand::Nvim)
+    run_backend(NvimBackend)
 }
 
 pub fn run_pi() -> Result<()> {
-    run_command(EmbeddedCommand::Pi)
+    run_backend(PiBackend)
 }
 
-fn run_shell_session() -> Result<()> {
+fn run_backend(backend: impl BackendSpec) -> Result<()> {
+    let workspace = Workspace::discover(std::env::current_dir()?)?;
+    let spec = backend.process_spec(&workspace);
+    run_session(&spec)
+}
+
+fn run_session(spec: &ProcessSpec) -> Result<()> {
     let mut terminal_guard = TerminalGuard::enter()?;
     let size = terminal_guard.terminal.size()?;
     let terminal_size = inner_terminal_size_value(size.width, size.height);
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-    let spec = ProcessSpec::new(shell)
-        .display_name("shell")
-        .env("TERM", "xterm-256color")
-        .cwd(std::env::current_dir()?);
-    let mut session = TerminalSession::spawn(&spec, terminal_size, 1_000)?;
+    let mut session = TerminalSession::spawn(spec, terminal_size, 1_000)?;
 
     loop {
         session.poll_output()?;
@@ -70,60 +73,6 @@ fn run_shell_session() -> Result<()> {
     }
 
     session.terminate();
-    Ok(())
-}
-
-fn run_command(command: EmbeddedCommand) -> Result<()> {
-    let mut terminal_guard = TerminalGuard::enter()?;
-    let size = terminal_guard.terminal.size()?;
-    let (pty_cols, pty_rows) = inner_terminal_size(size.width, size.height);
-
-    let mut pty = PtyProcess::spawn(command, pty_cols, pty_rows)?;
-    let mut parser = vt100::Parser::new(pty_rows, pty_cols, 1_000);
-
-    loop {
-        for bytes in pty.drain_output() {
-            parser.process(&bytes);
-            for response in terminal_query_responses(&bytes, &parser) {
-                pty.write_all(response.as_bytes())?;
-            }
-        }
-
-        if pty.has_exited()? {
-            break;
-        }
-
-        let size = terminal_guard.terminal.size()?;
-        let (pty_cols, pty_rows) = inner_terminal_size(size.width, size.height);
-        let (rows, cols) = parser.screen().size();
-        if rows != pty_rows || cols != pty_cols {
-            parser.screen_mut().set_size(pty_rows, pty_cols);
-            pty.resize(pty_cols, pty_rows)?;
-        }
-
-        terminal_guard.terminal.draw(|frame| {
-            render_pty(frame.area(), frame, &parser, pty.title(), true);
-        })?;
-
-        if event::poll(Duration::from_millis(16))? {
-            match event::read()? {
-                Event::Key(key) if is_quit(key) => break,
-                Event::Key(key) => {
-                    if let Some(bytes) = key_to_pty_bytes(key) {
-                        pty.write_all(&bytes)?;
-                    }
-                }
-                Event::Resize(cols, rows) => {
-                    let (pty_cols, pty_rows) = inner_terminal_size(cols, rows);
-                    parser.screen_mut().set_size(pty_rows, pty_cols);
-                    pty.resize(pty_cols, pty_rows)?;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    pty.kill();
     Ok(())
 }
 
@@ -296,17 +245,12 @@ impl EmbeddedCommand {
         }
     }
 
-    fn process_spec(self) -> Result<ProcessSpec> {
-        let program = match self {
-            Self::Shell => std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
-            Self::Nvim => "nvim".to_string(),
-            Self::Pi => "pi".to_string(),
-        };
-
-        Ok(ProcessSpec::new(program)
-            .display_name(self.title())
-            .env("TERM", "xterm-256color")
-            .cwd(std::env::current_dir()?))
+    fn process_spec(self, workspace: &Workspace) -> ProcessSpec {
+        match self {
+            Self::Shell => ShellBackend::system_default().process_spec(workspace),
+            Self::Nvim => NvimBackend.process_spec(workspace),
+            Self::Pi => PiBackend.process_spec(workspace),
+        }
     }
 }
 
@@ -317,7 +261,8 @@ pub(super) struct PtyProcess {
 
 impl PtyProcess {
     pub(super) fn spawn(command: EmbeddedCommand, cols: u16, rows: u16) -> Result<Self> {
-        let spec = command.process_spec()?;
+        let workspace = Workspace::discover(std::env::current_dir()?)?;
+        let spec = command.process_spec(&workspace);
         let process = crate::terminal::PtyProcess::spawn(&spec, TerminalSize::new(cols, rows))?;
         Ok(Self { command, process })
     }

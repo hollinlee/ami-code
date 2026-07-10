@@ -1,24 +1,20 @@
-use super::{Backend, BackendKind};
+use super::{BackendKind, BackendSpec, process_spec};
+use crate::terminal::ProcessSpec;
+use crate::workspace::Workspace;
 
-#[derive(Debug, Clone)]
-pub struct AgentBackend {
-    name: String,
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PiBackend;
 
-impl AgentBackend {
-    pub fn pi() -> Self {
-        Self {
-            name: "pi".to_string(),
-        }
-    }
-}
-
-impl Backend for AgentBackend {
+impl BackendSpec for PiBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Agent
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn display_name(&self) -> &str {
+        "pi"
+    }
+
+    fn process_spec(&self, workspace: &Workspace) -> ProcessSpec {
+        process_spec("pi", self.display_name(), workspace)
     }
 }
