@@ -8,9 +8,9 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::shell_spike::{
-    EmbeddedCommand, PtyProcess, TerminalGuard, inner_terminal_size, is_quit, key_to_pty_bytes,
-    render_pty, terminal_query_responses,
+    EmbeddedCommand, PtyProcess, TerminalGuard, is_quit, key_to_pty_bytes, terminal_query_responses,
 };
+use crate::ui::{TerminalPaneStyle, render_terminal_pane, terminal_content_size};
 
 pub fn run() -> Result<()> {
     let mut terminal_guard = TerminalGuard::enter()?;
@@ -64,7 +64,15 @@ pub fn run() -> Result<()> {
                 (PaneId::Bottom, layout.bottom),
             ] {
                 if let Some(pane) = panes.get(&id) {
-                    render_pty(area, frame, &pane.parser, pane.pty.title(), focused == id);
+                    let title = format!("ami-code {} spike — Ctrl+Q to quit", pane.pty.title());
+                    render_terminal_pane(
+                        frame,
+                        area,
+                        pane.parser.screen(),
+                        &title,
+                        focused == id,
+                        TerminalPaneStyle::default(),
+                    );
                 }
             }
         })?;
@@ -127,10 +135,10 @@ struct PtyPane {
 
 impl PtyPane {
     fn spawn(command: EmbeddedCommand, area: Rect) -> Result<Self> {
-        let (cols, rows) = inner_terminal_size(area.width, area.height);
+        let size = terminal_content_size(area);
         Ok(Self {
-            pty: PtyProcess::spawn(command, cols, rows)?,
-            parser: vt100::Parser::new(rows, cols, 1_000),
+            pty: PtyProcess::spawn(command, size.cols, size.rows)?,
+            parser: vt100::Parser::new(size.rows, size.cols, 1_000),
         })
     }
 
@@ -145,11 +153,11 @@ impl PtyPane {
     }
 
     fn resize_to_area(&mut self, area: Rect) -> Result<()> {
-        let (cols, rows) = inner_terminal_size(area.width, area.height);
+        let size = terminal_content_size(area);
         let (current_rows, current_cols) = self.parser.screen().size();
-        if current_rows != rows || current_cols != cols {
-            self.parser.screen_mut().set_size(rows, cols);
-            self.pty.resize(cols, rows)?;
+        if current_rows != size.rows || current_cols != size.cols {
+            self.pty.resize(size.cols, size.rows)?;
+            self.parser.screen_mut().set_size(size.rows, size.cols);
         }
         Ok(())
     }
