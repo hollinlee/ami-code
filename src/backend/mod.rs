@@ -2,9 +2,12 @@ mod agent;
 mod editor;
 mod shell;
 
-pub use agent::AgentBackend;
-pub use editor::EditorBackend;
+pub use agent::PiBackend;
+pub use editor::NvimBackend;
 pub use shell::ShellBackend;
+
+use crate::terminal::ProcessSpec;
+use crate::workspace::Workspace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -13,7 +16,56 @@ pub enum BackendKind {
     Shell,
 }
 
-pub trait Backend {
+pub trait BackendSpec {
     fn kind(&self) -> BackendKind;
-    fn name(&self) -> &str;
+    fn display_name(&self) -> &str;
+    fn process_spec(&self, workspace: &Workspace) -> ProcessSpec;
+}
+
+fn build_backend_process_spec(
+    program: impl Into<String>,
+    display_name: impl Into<String>,
+    workspace: &Workspace,
+) -> ProcessSpec {
+    ProcessSpec::new(program)
+        .display_name(display_name)
+        .env("TERM", "xterm-256color")
+        .cwd(workspace.root())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvim_spec_targets_workspace() {
+        let workspace = Workspace::discover(std::env::current_dir().unwrap()).unwrap();
+        let backend = NvimBackend;
+        let spec = backend.process_spec(&workspace);
+
+        assert_eq!(backend.kind(), BackendKind::Editor);
+        assert_eq!(spec.program, "nvim");
+        assert_eq!(spec.display_name, "nvim");
+        assert_eq!(spec.cwd.as_deref(), Some(workspace.root()));
+        assert_eq!(
+            spec.env.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+    }
+
+    #[test]
+    fn pi_spec_targets_workspace() {
+        let workspace = Workspace::discover(std::env::current_dir().unwrap()).unwrap();
+        let backend = PiBackend;
+        let spec = backend.process_spec(&workspace);
+
+        assert_eq!(backend.kind(), BackendKind::Agent);
+        assert_eq!(spec.program, "pi");
+        assert_eq!(spec.display_name, "pi");
+        assert_eq!(spec.cwd.as_deref(), Some(workspace.root()));
+        assert_eq!(
+            spec.env.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+    }
 }
