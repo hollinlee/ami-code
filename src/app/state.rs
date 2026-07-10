@@ -1,17 +1,17 @@
-use crate::workbench::{FocusGraph, Mode, PaneId, Workbench};
+use crate::workbench::{Mode, PaneId, WorkbenchState};
 use crate::workspace::Workspace;
 
 #[derive(Debug)]
 pub struct App {
     workspace: Workspace,
-    workbench: Workbench,
+    workbench: WorkbenchState,
 }
 
 impl App {
     pub fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
-            workbench: Workbench::new(FocusGraph::default()),
+            workbench: WorkbenchState::default(),
         }
     }
 

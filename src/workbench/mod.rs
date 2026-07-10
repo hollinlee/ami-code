@@ -1,36 +1,11 @@
 mod focus;
+mod layout;
 mod mode;
 mod pane;
+mod state;
 
-pub use focus::FocusGraph;
+pub use focus::{Direction, FocusGraph};
+pub use layout::{WorkbenchLayout, WorkbenchLayoutConfig};
 pub use mode::Mode;
 pub use pane::{PaneId, PaneKind, PaneState};
-
-#[derive(Debug)]
-pub struct Workbench {
-    mode: Mode,
-    focus_graph: FocusGraph,
-    focused_pane: PaneId,
-}
-
-impl Workbench {
-    pub fn new(focus_graph: FocusGraph) -> Self {
-        Self {
-            mode: Mode::Edit,
-            focus_graph,
-            focused_pane: PaneId::Editor,
-        }
-    }
-
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-
-    pub fn focused_pane(&self) -> PaneId {
-        self.focused_pane
-    }
-
-    pub fn focus_graph(&self) -> &FocusGraph {
-        &self.focus_graph
-    }
-}
+pub use state::WorkbenchState;

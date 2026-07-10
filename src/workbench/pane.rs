@@ -18,7 +18,6 @@ pub enum PaneKind {
 pub struct PaneState {
     pub id: PaneId,
     pub kind: PaneKind,
-    pub focused: bool,
     pub visible: bool,
 }
 
@@ -27,7 +26,6 @@ impl PaneState {
         Self {
             id,
             kind,
-            focused: false,
             visible: true,
         }
     }
