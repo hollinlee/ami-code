@@ -53,6 +53,7 @@ struct AppRuntime {
     launch_mode: LaunchMode,
     workbench: WorkbenchState,
     layout_config: WorkbenchLayoutConfig,
+    layout: Option<WorkbenchLayout>,
     sessions: HashMap<PaneId, TerminalSession>,
 }
 
@@ -60,8 +61,11 @@ impl AppRuntime {
     fn new(launch_mode: LaunchMode, workspace: Workspace, area: Rect) -> Result<Self> {
         let workbench = WorkbenchState::default();
         let layout_config = WorkbenchLayoutConfig::default();
-        let sessions = if launch_mode.is_workbench() {
-            Self::spawn_workbench_sessions(&workspace, area, layout_config)?
+        let layout = launch_mode
+            .is_workbench()
+            .then(|| WorkbenchLayout::calculate(area, layout_config));
+        let sessions = if let Some(layout) = layout {
+            Self::spawn_workbench_sessions(&workspace, layout)?
         } else {
             Self::spawn_single_session(launch_mode, &workspace, area)?
         };
@@ -70,6 +74,7 @@ impl AppRuntime {
             launch_mode,
             workbench,
             layout_config,
+            layout,
             sessions,
         })
     }
@@ -99,10 +104,8 @@ impl AppRuntime {
 
     fn spawn_workbench_sessions(
         workspace: &Workspace,
-        area: Rect,
-        layout_config: WorkbenchLayoutConfig,
+        layout: WorkbenchLayout,
     ) -> Result<HashMap<PaneId, TerminalSession>> {
-        let layout = WorkbenchLayout::calculate(area, layout_config);
         Ok(HashMap::from([
             (
                 PaneId::Editor,
@@ -152,6 +155,7 @@ impl AppRuntime {
                     session.resize(terminal_content_size(pane_area))?;
                 }
             }
+            self.layout = Some(layout);
         } else if let Some(session) = self.sessions.get_mut(&PaneId::Editor) {
             session.resize(terminal_content_size(area))?;
         }
@@ -167,7 +171,9 @@ impl AppRuntime {
     }
 
     fn render_workbench(&self, frame: &mut ratatui::Frame<'_>) {
-        let layout = WorkbenchLayout::calculate(frame.area(), self.layout_config);
+        let Some(layout) = self.layout else {
+            return;
+        };
         render_sidebar(
             frame,
             layout.sidebar,
@@ -305,24 +311,50 @@ fn is_control_toggle(key: KeyEvent) -> bool {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    _state: TerminalStateGuard,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
-        enable_raw_mode().context("failed to enable raw mode")?;
-        let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
-        let backend = CrosstermBackend::new(stdout);
+        let state = TerminalStateGuard::enter()?;
+        let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = Terminal::new(backend).context("failed to create ratatui terminal")?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            _state: state,
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
+    }
+}
+
+struct TerminalStateGuard {
+    alternate_screen: bool,
+}
+
+impl TerminalStateGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw mode")?;
+        let mut state = Self {
+            alternate_screen: false,
+        };
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        state.alternate_screen = true;
+        Ok(state)
+    }
+}
+
+impl Drop for TerminalStateGuard {
+    fn drop(&mut self) {
+        if self.alternate_screen {
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        }
+        let _ = disable_raw_mode();
     }
 }
 
