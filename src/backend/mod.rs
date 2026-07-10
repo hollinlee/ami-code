@@ -22,7 +22,7 @@ pub trait BackendSpec {
     fn process_spec(&self, workspace: &Workspace) -> ProcessSpec;
 }
 
-fn process_spec(
+fn build_backend_process_spec(
     program: impl Into<String>,
     display_name: impl Into<String>,
     workspace: &Workspace,

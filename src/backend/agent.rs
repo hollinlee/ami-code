@@ -1,4 +1,4 @@
-use super::{BackendKind, BackendSpec, process_spec};
+use super::{BackendKind, BackendSpec, build_backend_process_spec};
 use crate::terminal::ProcessSpec;
 use crate::workspace::Workspace;
 
@@ -15,6 +15,6 @@ impl BackendSpec for PiBackend {
     }
 
     fn process_spec(&self, workspace: &Workspace) -> ProcessSpec {
-        process_spec("pi", self.display_name(), workspace)
+        build_backend_process_spec(self.display_name(), self.display_name(), workspace)
     }
 }
