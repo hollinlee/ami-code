@@ -170,7 +170,14 @@ impl AppRuntime {
         if self.launch_mode.is_workbench() {
             self.render_workbench(frame);
         } else if let Some(session) = self.sessions.get(&PaneId::Editor) {
-            render_session(frame, frame.area(), session, true, self.status.as_deref());
+            render_session(
+                frame,
+                frame.area(),
+                session,
+                true,
+                None,
+                self.status.as_deref(),
+            );
         }
     }
 
@@ -197,6 +204,7 @@ impl AppRuntime {
                     area,
                     session,
                     self.workbench.is_focused(pane),
+                    self.workbench.selection_range(pane),
                     self.status.as_deref(),
                 );
             }
@@ -231,12 +239,18 @@ impl AppRuntime {
 
     fn handle_workbench_key(&mut self, key: KeyEvent) -> Result<()> {
         if let Some(direction) = global_focus_direction(key) {
-            self.workbench.focus(direction);
+            if self.workbench.focus(direction) && self.workbench.mode() == Mode::View {
+                self.begin_view_selection();
+            }
             return Ok(());
         }
 
         if is_control_toggle(key) {
-            self.workbench.toggle_control_mode();
+            if self.workbench.mode() == Mode::View {
+                self.leave_view_mode(Mode::Control);
+            } else {
+                self.workbench.toggle_control_mode();
+            }
             return Ok(());
         }
 
@@ -249,24 +263,116 @@ impl AppRuntime {
             Mode::Control => match key.code {
                 KeyCode::Esc => self.workbench.set_mode(Mode::Edit),
                 KeyCode::Char('p') => self.paste_system_clipboard(),
-                KeyCode::Char('v') => self.workbench.set_mode(Mode::View),
+                KeyCode::Char('v') => self.begin_view_selection(),
                 code => {
                     if let Some(direction) = direction_for_key(code) {
                         self.workbench.focus(direction);
                     }
                 }
             },
-            Mode::View => match key.code {
-                KeyCode::Esc => self.workbench.set_mode(Mode::Edit),
-                code => {
-                    if let Some(direction) = direction_for_key(code) {
-                        self.workbench.focus(direction);
-                    }
-                }
-            },
+            Mode::View => self.handle_view_key(key),
         }
 
         Ok(())
+    }
+
+    fn handle_view_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.leave_view_mode(Mode::Edit),
+            KeyCode::Char('y') => self.yank_selection(),
+            KeyCode::Char('h') => self.move_selection(0, -1),
+            KeyCode::Char('j') => self.move_selection(1, 0),
+            KeyCode::Char('k') => self.move_selection(-1, 0),
+            KeyCode::Char('l') => self.move_selection(0, 1),
+            KeyCode::Char('0') => self.move_selection_to_line_edge(false),
+            KeyCode::Char('$') => self.move_selection_to_line_edge(true),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.page_selection(-1, false);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.page_selection(1, false);
+            }
+            KeyCode::PageUp => self.page_selection(-1, true),
+            KeyCode::PageDown => self.page_selection(1, true),
+            _ => {}
+        }
+    }
+
+    fn begin_view_selection(&mut self) {
+        let pane = self.workbench.focused_pane();
+        let Some(session) = self.sessions.get_mut(&pane) else {
+            self.workbench.clear_selection();
+            self.workbench.set_mode(Mode::Control);
+            self.set_status("focused pane does not support text selection");
+            return;
+        };
+        let anchor = session.selection_cursor();
+        self.workbench.begin_selection(anchor);
+        self.workbench.set_mode(Mode::View);
+        self.status = None;
+    }
+
+    fn move_selection(&mut self, row_delta: i64, col_delta: i32) {
+        let Some(selection) = self.workbench.selection() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&selection.pane()) else {
+            return;
+        };
+        let head = session.move_selection_point(selection.head(), row_delta, col_delta);
+        self.workbench.set_selection_head(head);
+    }
+
+    fn move_selection_to_line_edge(&mut self, end: bool) {
+        let Some(selection) = self.workbench.selection() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&selection.pane()) else {
+            return;
+        };
+        let head = session.move_selection_to_line_edge(selection.head(), end);
+        self.workbench.set_selection_head(head);
+    }
+
+    fn page_selection(&mut self, direction: i64, full_page: bool) {
+        let Some(selection) = self.workbench.selection() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&selection.pane()) else {
+            return;
+        };
+        let delta = session.page_rows(full_page).saturating_mul(direction);
+        let head = session.move_selection_point(selection.head(), delta, 0);
+        self.workbench.set_selection_head(head);
+    }
+
+    fn yank_selection(&mut self) {
+        let Some(selection) = self.workbench.selection() else {
+            self.set_status("no active selection");
+            return;
+        };
+        let Some(session) = self.sessions.get(&selection.pane()) else {
+            self.set_status("selected pane is unavailable");
+            return;
+        };
+        let contents = session.selected_text(selection.range());
+        match crate::clipboard::write_system(&contents) {
+            Ok(()) => {
+                self.status = None;
+                self.leave_view_mode(Mode::Control);
+            }
+            Err(error) => self.set_status(format!("clipboard error: {error}")),
+        }
+    }
+
+    fn leave_view_mode(&mut self, next_mode: Mode) {
+        if let Some(selection) = self.workbench.selection()
+            && let Some(session) = self.sessions.get_mut(&selection.pane())
+        {
+            session.reset_scrollback();
+        }
+        self.workbench.clear_selection();
+        self.workbench.set_mode(next_mode);
     }
 
     fn paste_system_clipboard(&mut self) {
@@ -326,6 +432,7 @@ fn render_session(
     area: Rect,
     session: &TerminalSession,
     focused: bool,
+    selection: Option<crate::terminal::TerminalRange>,
     status: Option<&str>,
 ) {
     let title = session_title(session.display_name(), status, area.width);
@@ -335,6 +442,7 @@ fn render_session(
         session.screen(),
         &title,
         focused,
+        selection,
         TerminalPaneStyle::default(),
     );
 }
