@@ -122,16 +122,7 @@ impl TerminalSession {
 
     fn reveal(&mut self, point: TerminalPoint) {
         let (rows, _) = self.parser.screen().size();
-        let current = i64::try_from(self.parser.screen().scrollback()).unwrap_or(i64::MAX);
-        let top = -current;
-        let bottom = i64::from(rows.saturating_sub(1)) - current;
-        let target = if point.row < top {
-            point.row.unsigned_abs() as usize
-        } else if point.row > bottom {
-            usize::try_from(i64::from(rows.saturating_sub(1)) - point.row).unwrap_or(0)
-        } else {
-            self.parser.screen().scrollback()
-        };
+        let target = scrollback_to_reveal(rows, self.parser.screen().scrollback(), point.row);
         self.parser.screen_mut().set_scrollback(target);
     }
 
@@ -150,5 +141,37 @@ impl TerminalSession {
 
     pub fn terminate(&mut self) {
         self.process.terminate();
+    }
+}
+
+fn scrollback_to_reveal(rows: u16, current: usize, point_row: i64) -> usize {
+    let current_row = i64::try_from(current).unwrap_or(i64::MAX);
+    let live_bottom = i64::from(rows.saturating_sub(1));
+    let visible_top = -current_row;
+    let visible_bottom = live_bottom - current_row;
+
+    if point_row < visible_top {
+        point_row.unsigned_abs() as usize
+    } else if point_row > visible_bottom {
+        usize::try_from(live_bottom.saturating_sub(point_row).max(0)).unwrap_or(0)
+    } else {
+        current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reveals_points_above_and_below_viewport() {
+        assert_eq!(scrollback_to_reveal(20, 10, -12), 12);
+        assert_eq!(scrollback_to_reveal(20, 10, 15), 4);
+        assert_eq!(scrollback_to_reveal(20, 10, 5), 10);
+    }
+
+    #[test]
+    fn clamps_invalid_points_to_live_viewport() {
+        assert_eq!(scrollback_to_reveal(20, 10, 25), 0);
     }
 }
