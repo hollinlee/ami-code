@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -55,6 +57,7 @@ struct AppRuntime {
     layout_config: WorkbenchLayoutConfig,
     layout: Option<WorkbenchLayout>,
     sessions: HashMap<PaneId, TerminalSession>,
+    status: Option<String>,
 }
 
 impl AppRuntime {
@@ -76,6 +79,7 @@ impl AppRuntime {
             layout_config,
             layout,
             sessions,
+            status: None,
         })
     }
 
@@ -166,7 +170,7 @@ impl AppRuntime {
         if self.launch_mode.is_workbench() {
             self.render_workbench(frame);
         } else if let Some(session) = self.sessions.get(&PaneId::Editor) {
-            render_session(frame, frame.area(), session, true);
+            render_session(frame, frame.area(), session, true, self.status.as_deref());
         }
     }
 
@@ -188,24 +192,38 @@ impl AppRuntime {
             (PaneId::Bottom, layout.bottom),
         ] {
             if let Some(session) = self.sessions.get(&pane) {
-                render_session(frame, area, session, self.workbench.is_focused(pane));
+                render_session(
+                    frame,
+                    area,
+                    session,
+                    self.workbench.is_focused(pane),
+                    self.status.as_deref(),
+                );
             }
         }
     }
 
     fn handle_event(&mut self, event: Event) -> Result<bool> {
-        let Event::Key(key) = event else {
-            return Ok(true);
-        };
+        match event {
+            Event::Key(key) => {
+                if is_quit(key) {
+                    return Ok(false);
+                }
 
-        if is_quit(key) {
-            return Ok(false);
-        }
-
-        if self.launch_mode.is_workbench() {
-            self.handle_workbench_key(key)?;
-        } else if let Some(session) = self.sessions.get_mut(&PaneId::Editor) {
-            session.send_key(key)?;
+                if self.launch_mode.is_workbench() {
+                    self.handle_workbench_key(key)?;
+                } else if let Some(session) = self.sessions.get_mut(&PaneId::Editor) {
+                    session.send_key(key)?;
+                }
+            }
+            Event::Paste(contents) => {
+                if self.launch_mode.is_workbench() && self.workbench.mode() != Mode::Edit {
+                    self.set_status("paste is only available in Edit mode");
+                } else {
+                    self.paste_into_focused(&contents);
+                }
+            }
+            _ => {}
         }
 
         Ok(true)
@@ -228,9 +246,18 @@ impl AppRuntime {
                     session.send_key(key)?;
                 }
             }
-            Mode::Control | Mode::View => match key.code {
+            Mode::Control => match key.code {
                 KeyCode::Esc => self.workbench.set_mode(Mode::Edit),
+                KeyCode::Char('p') => self.paste_system_clipboard(),
                 KeyCode::Char('v') => self.workbench.set_mode(Mode::View),
+                code => {
+                    if let Some(direction) = direction_for_key(code) {
+                        self.workbench.focus(direction);
+                    }
+                }
+            },
+            Mode::View => match key.code {
+                KeyCode::Esc => self.workbench.set_mode(Mode::Edit),
                 code => {
                     if let Some(direction) = direction_for_key(code) {
                         self.workbench.focus(direction);
@@ -240,6 +267,34 @@ impl AppRuntime {
         }
 
         Ok(())
+    }
+
+    fn paste_system_clipboard(&mut self) {
+        match crate::clipboard::read_system() {
+            Ok(contents) => self.paste_into_focused(&contents),
+            Err(error) => self.set_status(format!("clipboard error: {error}")),
+        }
+    }
+
+    fn paste_into_focused(&mut self, contents: &str) {
+        let pane = if self.launch_mode.is_workbench() {
+            self.workbench.focused_pane()
+        } else {
+            PaneId::Editor
+        };
+        let Some(session) = self.sessions.get_mut(&pane) else {
+            self.set_status("focused pane does not accept paste");
+            return;
+        };
+
+        match session.send_paste(contents) {
+            Ok(()) => self.status = None,
+            Err(error) => self.set_status(format!("paste rejected: {error}")),
+        }
+    }
+
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status = Some(message.into());
     }
 }
 
@@ -271,8 +326,9 @@ fn render_session(
     area: Rect,
     session: &TerminalSession,
     focused: bool,
+    status: Option<&str>,
 ) {
-    let title = format!("ami-code {} — Ctrl+Q to quit", session.display_name());
+    let title = session_title(session.display_name(), status, area.width);
     render_terminal_pane(
         frame,
         area,
@@ -281,6 +337,29 @@ fn render_session(
         focused,
         TerminalPaneStyle::default(),
     );
+}
+
+fn session_title(display_name: &str, status: Option<&str>, pane_width: u16) -> String {
+    let base_title = format!("ami-code {display_name} — Ctrl+Q to quit");
+    let available = usize::from(pane_width.saturating_sub(2));
+    let remaining = available.saturating_sub(base_title.chars().count() + 3);
+    match status.filter(|status| !status.is_empty() && remaining > 0) {
+        Some(status) => format!("{base_title} — {}", truncate(status, remaining)),
+        None => base_title,
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+
+    let mut truncated: String = value.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn is_quit(key: KeyEvent) -> bool {
@@ -334,6 +413,7 @@ impl Drop for TerminalGuard {
 
 struct TerminalStateGuard {
     alternate_screen: bool,
+    bracketed_paste: bool,
 }
 
 impl TerminalStateGuard {
@@ -341,16 +421,22 @@ impl TerminalStateGuard {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut state = Self {
             alternate_screen: false,
+            bracketed_paste: false,
         };
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
         state.alternate_screen = true;
+        execute!(stdout, EnableBracketedPaste).context("failed to enable bracketed paste")?;
+        state.bracketed_paste = true;
         Ok(state)
     }
 }
 
 impl Drop for TerminalStateGuard {
     fn drop(&mut self) {
+        if self.bracketed_paste {
+            let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        }
         if self.alternate_screen {
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
         }
@@ -361,6 +447,18 @@ impl Drop for TerminalStateGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_status_to_available_title_width() {
+        assert_eq!(
+            session_title("pi", Some("clipboard unavailable"), 40),
+            "ami-code pi — Ctrl+Q to quit — clipbo…"
+        );
+        assert_eq!(
+            session_title("pi", Some("ignored"), 20),
+            "ami-code pi — Ctrl+Q to quit"
+        );
+    }
 
     #[test]
     fn maps_vim_focus_keys() {

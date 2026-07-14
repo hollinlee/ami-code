@@ -1,5 +1,6 @@
 mod app;
 mod backend;
+mod clipboard;
 mod terminal;
 mod ui;
 mod workbench;
