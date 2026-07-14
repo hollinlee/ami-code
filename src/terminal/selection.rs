@@ -54,7 +54,9 @@ pub fn normalize_point(
     mut point: TerminalPoint,
     moving_forward: bool,
 ) -> TerminalPoint {
-    let Some((snapshot, visible_row)) = snapshot_at_row(screen, point.row) else {
+    let max_history = max_scrollback(screen);
+    let mut snapshot = screen.clone();
+    let Some(visible_row) = reveal_history_row(&mut snapshot, point.row, max_history) else {
         return point;
     };
     if snapshot
@@ -71,7 +73,9 @@ pub fn normalize_point(
 }
 
 pub fn line_end(screen: &vt100::Screen, point: TerminalPoint) -> u16 {
-    let Some((snapshot, visible_row)) = snapshot_at_row(screen, point.row) else {
+    let max_history = max_scrollback(screen);
+    let mut snapshot = screen.clone();
+    let Some(visible_row) = reveal_history_row(&mut snapshot, point.row, max_history) else {
         return 0;
     };
     let (_, cols) = snapshot.size();
@@ -86,17 +90,19 @@ pub fn line_end(screen: &vt100::Screen, point: TerminalPoint) -> u16 {
 }
 
 pub fn extract(screen: &vt100::Screen, range: TerminalRange) -> String {
-    let Some((start_col, _)) = cell_bounds(screen, range.start) else {
+    let max_history = max_scrollback(screen);
+    let mut snapshot = screen.clone();
+    let Some((start_col, _)) = cell_bounds(&mut snapshot, range.start, max_history) else {
         return String::new();
     };
-    let Some((_, end_col)) = cell_bounds(screen, range.end) else {
+    let Some((_, end_col)) = cell_bounds(&mut snapshot, range.end, max_history) else {
         return String::new();
     };
     let (_, cols) = screen.size();
     let mut contents = String::new();
 
     for row in range.start.row..=range.end.row {
-        let Some((snapshot, visible_row)) = snapshot_at_row(screen, row) else {
+        let Some(visible_row) = reveal_history_row(&mut snapshot, row, max_history) else {
             continue;
         };
         let row_start = if row == range.start.row { start_col } else { 0 };
@@ -117,8 +123,12 @@ pub fn extract(screen: &vt100::Screen, range: TerminalRange) -> String {
     contents
 }
 
-fn cell_bounds(screen: &vt100::Screen, point: TerminalPoint) -> Option<(u16, u16)> {
-    let (snapshot, visible_row) = snapshot_at_row(screen, point.row)?;
+fn cell_bounds(
+    snapshot: &mut vt100::Screen,
+    point: TerminalPoint,
+    max_history: usize,
+) -> Option<(u16, u16)> {
+    let visible_row = reveal_history_row(snapshot, point.row, max_history)?;
     let (_, cols) = snapshot.size();
     let col = point.col.min(cols.saturating_sub(1));
     let cell = snapshot.cell(visible_row, col)?;
@@ -131,20 +141,23 @@ fn cell_bounds(screen: &vt100::Screen, point: TerminalPoint) -> Option<(u16, u16
     }
 }
 
-fn snapshot_at_row(screen: &vt100::Screen, history_row: i64) -> Option<(vt100::Screen, u16)> {
+fn reveal_history_row(
+    screen: &mut vt100::Screen,
+    history_row: i64,
+    max_history: usize,
+) -> Option<u16> {
     let (rows, _) = screen.size();
-    let max_history = i64::try_from(max_scrollback(screen)).unwrap_or(i64::MAX);
+    let max_history = i64::try_from(max_history).unwrap_or(i64::MAX);
     if history_row < -max_history || history_row >= i64::from(rows) {
         return None;
     }
 
-    let mut snapshot = screen.clone();
     if history_row < 0 {
-        snapshot.set_scrollback(history_row.unsigned_abs() as usize);
-        Some((snapshot, 0))
+        screen.set_scrollback(history_row.unsigned_abs() as usize);
+        Some(0)
     } else {
-        snapshot.set_scrollback(0);
-        Some((snapshot, history_row as u16))
+        screen.set_scrollback(0);
+        Some(history_row as u16)
     }
 }
 
