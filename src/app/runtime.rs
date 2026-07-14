@@ -328,9 +328,10 @@ fn render_session(
     focused: bool,
     status: Option<&str>,
 ) {
+    let base_title = format!("ami-code {} — Ctrl+Q to quit", session.display_name());
     let title = match status {
-        Some(status) => format!("ami-code {} — {status}", session.display_name()),
-        None => format!("ami-code {} — Ctrl+Q to quit", session.display_name()),
+        Some(status) => format!("{base_title} — {status}"),
+        None => base_title,
     };
     render_terminal_pane(
         frame,
