@@ -54,6 +54,10 @@ impl WorkbenchState {
 
     pub fn focus(&mut self, direction: Direction) -> bool {
         let target = self.focus_graph.next(self.focused_pane, direction);
+        self.focus_pane(target)
+    }
+
+    pub fn focus_pane(&mut self, target: PaneId) -> bool {
         if target != self.focused_pane && self.pane(target).is_some_and(|pane| pane.visible) {
             self.focused_pane = target;
             true

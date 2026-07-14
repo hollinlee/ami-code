@@ -1,7 +1,8 @@
 use anyhow::Result;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 use super::input::encode_key;
+use super::mouse;
 use super::paste::{self, PasteError};
 use super::process::{ProcessSpec, PtyProcess, TerminalSize};
 use super::query;
@@ -60,6 +61,40 @@ impl TerminalSession {
         self.parser.screen_mut().set_scrollback(0);
         let (row, col) = self.parser.screen().cursor_position();
         TerminalPoint::new(i64::from(row), col)
+    }
+
+    pub fn viewport_point(&self, row: u16, col: u16) -> TerminalPoint {
+        let (rows, cols) = self.parser.screen().size();
+        let scrollback = i64::try_from(self.parser.screen().scrollback()).unwrap_or(i64::MAX);
+        let point = TerminalPoint::new(
+            i64::from(row.min(rows.saturating_sub(1))) - scrollback,
+            col.min(cols.saturating_sub(1)),
+        );
+        selection::normalize_point(self.parser.screen(), point, false)
+    }
+
+    pub fn mouse_reporting(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    pub fn send_mouse(&mut self, event: MouseEvent) -> Result<()> {
+        let screen = self.parser.screen();
+        if let Some(bytes) = mouse::encode(
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            event,
+        ) {
+            self.process.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn scroll_viewport(&mut self, lines: i32) {
+        let current = i64::try_from(self.parser.screen().scrollback()).unwrap_or(i64::MAX);
+        let maximum =
+            i64::try_from(selection::max_scrollback(self.parser.screen())).unwrap_or(i64::MAX);
+        let target = current.saturating_add(i64::from(lines)).clamp(0, maximum) as usize;
+        self.parser.screen_mut().set_scrollback(target);
     }
 
     pub fn move_selection_point(
