@@ -2,6 +2,7 @@ use anyhow::Result;
 use crossterm::event::KeyEvent;
 
 use super::input::encode_key;
+use super::paste::{self, PasteError};
 use super::process::{ProcessSpec, PtyProcess, TerminalSize};
 use super::query;
 
@@ -47,6 +48,11 @@ impl TerminalSession {
             self.process.write_all(&bytes)?;
         }
         Ok(())
+    }
+
+    pub fn send_paste(&mut self, contents: &str) -> Result<(), PasteError> {
+        let bytes = paste::encode(contents, self.parser.screen().bracketed_paste())?;
+        self.process.write_all(&bytes).map_err(PasteError::Write)
     }
 
     pub fn resize(&mut self, size: TerminalSize) -> Result<()> {

@@ -1,4 +1,5 @@
 mod input;
+mod paste;
 mod process;
 mod query;
 mod session;
