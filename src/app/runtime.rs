@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -20,16 +21,18 @@ use crate::ui::{
     SidebarStyle, TerminalPaneStyle, render_sidebar, render_terminal_pane, terminal_content_size,
 };
 use crate::workbench::{
-    Direction, Mode, PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState,
+    Direction, Mode, MouseTarget, PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState,
+    hit_test,
 };
 use crate::workspace::Workspace;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SCROLLBACK_LINES: usize = 1_000;
+const MOUSE_WHEEL_LINES: i32 = 3;
 
 pub fn run(mode: LaunchMode) -> Result<()> {
     let workspace = Workspace::discover(std::env::current_dir()?)?;
-    let mut terminal = TerminalGuard::enter()?;
+    let mut terminal = TerminalGuard::enter(mode.is_workbench())?;
     let area = terminal.terminal.size()?.into();
     let mut runtime = AppRuntime::new(mode, workspace, area)?;
 
@@ -51,6 +54,13 @@ pub fn run(mode: LaunchMode) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingMouseGesture {
+    target: MouseTarget,
+    down: MouseEvent,
+    dragging: bool,
+}
+
 struct AppRuntime {
     launch_mode: LaunchMode,
     workbench: WorkbenchState,
@@ -58,6 +68,7 @@ struct AppRuntime {
     layout: Option<WorkbenchLayout>,
     sessions: HashMap<PaneId, TerminalSession>,
     status: Option<String>,
+    pending_mouse: Option<PendingMouseGesture>,
 }
 
 impl AppRuntime {
@@ -80,6 +91,7 @@ impl AppRuntime {
             layout,
             sessions,
             status: None,
+            pending_mouse: None,
         })
     }
 
@@ -214,6 +226,7 @@ impl AppRuntime {
     fn handle_event(&mut self, event: Event) -> Result<bool> {
         match event {
             Event::Key(key) => {
+                self.pending_mouse = None;
                 if is_quit(key) {
                     return Ok(false);
                 }
@@ -230,6 +243,9 @@ impl AppRuntime {
                 } else {
                     self.paste_into_focused(&contents);
                 }
+            }
+            Event::Mouse(mouse) if self.launch_mode.is_workbench() => {
+                self.handle_mouse_event(mouse)?;
             }
             _ => {}
         }
@@ -375,6 +391,173 @@ impl AppRuntime {
         self.workbench.set_mode(next_mode);
     }
 
+    fn handle_mouse_event(&mut self, event: MouseEvent) -> Result<()> {
+        let Some(layout) = self.layout else {
+            return Ok(());
+        };
+        let target = hit_test(layout, event.column, event.row);
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(target) = target else {
+                    return Ok(());
+                };
+                self.focus_mouse_target(target);
+                self.pending_mouse = Some(PendingMouseGesture {
+                    target,
+                    down: event,
+                    dragging: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(mut pending) = self.pending_mouse else {
+                    return Ok(());
+                };
+                if !pending.dragging {
+                    pending.dragging = self.begin_mouse_selection(pending.target);
+                }
+                if pending.dragging {
+                    self.update_mouse_selection(target);
+                }
+                self.pending_mouse = Some(pending);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pending) = self.pending_mouse.take() else {
+                    return Ok(());
+                };
+                if pending.dragging {
+                    self.update_mouse_selection(target);
+                } else {
+                    self.finish_mouse_click(pending, event)?;
+                }
+            }
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => self.route_mouse_wheel(target, event)?,
+            MouseEventKind::Moved => self.forward_mouse_motion(target, event)?,
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn focus_mouse_target(&mut self, target: MouseTarget) {
+        let previous_selection = self.workbench.selection();
+        if self.workbench.focus_pane(target.pane()) && self.workbench.mode() == Mode::View {
+            if let Some(selection) = previous_selection
+                && let Some(session) = self.sessions.get_mut(&selection.pane())
+            {
+                session.reset_scrollback();
+            }
+            self.workbench.clear_selection();
+            if !matches!(target, MouseTarget::Content { .. }) {
+                self.workbench.set_mode(Mode::Control);
+            }
+        }
+    }
+
+    fn begin_mouse_selection(&mut self, target: MouseTarget) -> bool {
+        let MouseTarget::Content { pane, row, col } = target else {
+            return false;
+        };
+        let Some(session) = self.sessions.get(&pane) else {
+            return false;
+        };
+        let anchor = session.viewport_point(row, col);
+        self.workbench.begin_selection(anchor);
+        self.workbench.set_mode(Mode::View);
+        self.status = None;
+        true
+    }
+
+    fn update_mouse_selection(&mut self, target: Option<MouseTarget>) {
+        let Some(selection) = self.workbench.selection() else {
+            return;
+        };
+        let Some(MouseTarget::Content { pane, row, col }) = target else {
+            return;
+        };
+        if pane != selection.pane() {
+            return;
+        }
+        let Some(session) = self.sessions.get(&pane) else {
+            return;
+        };
+        self.workbench
+            .set_selection_head(session.viewport_point(row, col));
+    }
+
+    fn finish_mouse_click(
+        &mut self,
+        pending: PendingMouseGesture,
+        release: MouseEvent,
+    ) -> Result<()> {
+        let MouseTarget::Content { pane, row, col } = pending.target else {
+            return Ok(());
+        };
+        if self.workbench.mode() == Mode::View {
+            let Some(session) = self.sessions.get(&pane) else {
+                return Ok(());
+            };
+            self.workbench
+                .begin_selection(session.viewport_point(row, col));
+            return Ok(());
+        }
+        if self.workbench.mode() != Mode::Edit {
+            return Ok(());
+        }
+
+        let Some(session) = self.sessions.get_mut(&pane) else {
+            return Ok(());
+        };
+        session.send_mouse(mouse_at(pending.down, row, col))?;
+        session.send_mouse(mouse_at(release, row, col))?;
+        Ok(())
+    }
+
+    fn forward_mouse_motion(
+        &mut self,
+        target: Option<MouseTarget>,
+        event: MouseEvent,
+    ) -> Result<()> {
+        let Some(MouseTarget::Content { pane, row, col }) = target else {
+            return Ok(());
+        };
+        if self.workbench.mode() == Mode::Edit
+            && let Some(session) = self.sessions.get_mut(&pane)
+        {
+            session.send_mouse(mouse_at(event, row, col))?;
+        }
+        Ok(())
+    }
+
+    fn route_mouse_wheel(&mut self, target: Option<MouseTarget>, event: MouseEvent) -> Result<()> {
+        let Some(MouseTarget::Content { pane, row, col }) = target else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get_mut(&pane) else {
+            return Ok(());
+        };
+        let lines = match event.kind {
+            MouseEventKind::ScrollUp => MOUSE_WHEEL_LINES,
+            MouseEventKind::ScrollDown => -MOUSE_WHEEL_LINES,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => 0,
+            _ => return Ok(()),
+        };
+
+        match self.workbench.mode() {
+            Mode::View if lines != 0 => session.scroll_viewport(lines),
+            Mode::View => {}
+            Mode::Edit if session.mouse_reporting() => {
+                session.send_mouse(mouse_at(event, row, col))?;
+            }
+            Mode::Edit if lines != 0 => session.scroll_viewport(lines),
+            Mode::Edit | Mode::Control => {}
+        }
+        Ok(())
+    }
+
     fn paste_system_clipboard(&mut self) {
         match crate::clipboard::read_system() {
             Ok(contents) => self.paste_into_focused(&contents),
@@ -447,6 +630,12 @@ fn render_session(
     );
 }
 
+fn mouse_at(mut event: MouseEvent, row: u16, col: u16) -> MouseEvent {
+    event.row = row;
+    event.column = col;
+    event
+}
+
 fn session_title(display_name: &str, status: Option<&str>, pane_width: u16) -> String {
     let base_title = format!("ami-code {display_name} — Ctrl+Q to quit");
     let available = usize::from(pane_width.saturating_sub(2));
@@ -502,8 +691,8 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        let state = TerminalStateGuard::enter()?;
+    fn enter(capture_mouse: bool) -> Result<Self> {
+        let state = TerminalStateGuard::enter(capture_mouse)?;
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = Terminal::new(backend).context("failed to create ratatui terminal")?;
         Ok(Self {
@@ -522,26 +711,35 @@ impl Drop for TerminalGuard {
 struct TerminalStateGuard {
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
 }
 
 impl TerminalStateGuard {
-    fn enter() -> Result<Self> {
+    fn enter(capture_mouse: bool) -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut state = Self {
             alternate_screen: false,
             bracketed_paste: false,
+            mouse_capture: false,
         };
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
         state.alternate_screen = true;
         execute!(stdout, EnableBracketedPaste).context("failed to enable bracketed paste")?;
         state.bracketed_paste = true;
+        if capture_mouse {
+            execute!(stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
+            state.mouse_capture = true;
+        }
         Ok(state)
     }
 }
 
 impl Drop for TerminalStateGuard {
     fn drop(&mut self) {
+        if self.mouse_capture {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
         if self.bracketed_paste {
             let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         }
