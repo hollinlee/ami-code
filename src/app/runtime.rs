@@ -328,11 +328,7 @@ fn render_session(
     focused: bool,
     status: Option<&str>,
 ) {
-    let base_title = format!("ami-code {} — Ctrl+Q to quit", session.display_name());
-    let title = match status {
-        Some(status) => format!("{base_title} — {status}"),
-        None => base_title,
-    };
+    let title = session_title(session.display_name(), status, area.width);
     render_terminal_pane(
         frame,
         area,
@@ -341,6 +337,29 @@ fn render_session(
         focused,
         TerminalPaneStyle::default(),
     );
+}
+
+fn session_title(display_name: &str, status: Option<&str>, pane_width: u16) -> String {
+    let base_title = format!("ami-code {display_name} — Ctrl+Q to quit");
+    let available = usize::from(pane_width.saturating_sub(2));
+    let remaining = available.saturating_sub(base_title.chars().count() + 3);
+    match status.filter(|status| !status.is_empty() && remaining > 0) {
+        Some(status) => format!("{base_title} — {}", truncate(status, remaining)),
+        None => base_title,
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+
+    let mut truncated: String = value.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn is_quit(key: KeyEvent) -> bool {
@@ -428,6 +447,18 @@ impl Drop for TerminalStateGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_status_to_available_title_width() {
+        assert_eq!(
+            session_title("pi", Some("clipboard unavailable"), 40),
+            "ami-code pi — Ctrl+Q to quit — clipbo…"
+        );
+        assert_eq!(
+            session_title("pi", Some("ignored"), 20),
+            "ami-code pi — Ctrl+Q to quit"
+        );
+    }
 
     #[test]
     fn maps_vim_focus_keys() {
