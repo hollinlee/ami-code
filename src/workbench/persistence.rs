@@ -1,5 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
+#[cfg(unix)]
+use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -131,6 +133,7 @@ impl LayoutStore {
                 .context("failed to sync temporary layout state")?;
             drop(file);
             fs::rename(&temp, &self.path).context("failed to atomically replace layout state")?;
+            sync_parent_directory(parent)?;
             Ok(())
         })();
         if result.is_err() {
@@ -157,6 +160,19 @@ impl LayoutStore {
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    File::open(parent)
+        .context("failed to open layout state directory for sync")?
+        .sync_all()
+        .context("failed to sync layout state directory")
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn validate(intent: LayoutIntent) -> Result<()> {
