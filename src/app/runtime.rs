@@ -19,10 +19,12 @@ use super::LaunchMode;
 use crate::backend::{BackendKind, BackendSpec, NvimBackend, PiBackend, ShellBackend};
 use crate::terminal::TerminalSession;
 use crate::ui::{
-    SidebarStyle, TerminalPaneStyle, render_sidebar, render_terminal_pane, terminal_content_size,
+    SidebarStyle, TerminalPaneStyle, render_compact_workbench, render_sidebar,
+    render_terminal_pane, terminal_content_size,
 };
 use crate::workbench::{
-    MouseTarget, PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState, hit_test,
+    MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, MouseTarget, PaneId, WorkbenchLayout,
+    WorkbenchLayoutConfig, WorkbenchState, hit_test,
 };
 use crate::workspace::Workspace;
 
@@ -78,11 +80,12 @@ struct AppRuntime {
 
 impl AppRuntime {
     fn new(launch_mode: LaunchMode, workspace: Workspace, area: Rect) -> Result<Self> {
-        let workbench = WorkbenchState::default();
+        let mut workbench = WorkbenchState::default();
         let layout_config = WorkbenchLayoutConfig::default();
-        let layout = launch_mode
-            .is_workbench()
-            .then(|| WorkbenchLayout::calculate(area, layout_config));
+        let layout = launch_mode.is_workbench().then(|| {
+            workbench.update_auto_collapse(area, layout_config);
+            WorkbenchLayout::calculate_visible(area, layout_config, workbench.visibility())
+        });
         let sessions = if let Some(layout) = layout {
             Self::spawn_workbench_sessions(&workspace, layout)?
         } else {
@@ -166,7 +169,13 @@ impl AppRuntime {
 
     fn resize(&mut self, area: Rect) -> Result<()> {
         if self.launch_mode.is_workbench() {
-            let layout = WorkbenchLayout::calculate(area, self.layout_config);
+            self.workbench
+                .update_auto_collapse(area, self.layout_config);
+            let layout = WorkbenchLayout::calculate_visible(
+                area,
+                self.layout_config,
+                self.workbench.visibility(),
+            );
             if self.layout != Some(layout) {
                 self.pending_mouse = None;
                 self.clear_selection();
@@ -176,7 +185,10 @@ impl AppRuntime {
                 (PaneId::Agent, layout.agent),
                 (PaneId::Bottom, layout.bottom),
             ] {
-                if let Some(session) = self.sessions.get_mut(&pane) {
+                if pane_area.width >= MIN_TERMINAL_WIDTH
+                    && pane_area.height >= MIN_TERMINAL_HEIGHT
+                    && let Some(session) = self.sessions.get_mut(&pane)
+                {
                     session.resize(terminal_content_size(pane_area))?;
                 }
             }
@@ -206,19 +218,28 @@ impl AppRuntime {
         let Some(layout) = self.layout else {
             return;
         };
-        render_sidebar(
-            frame,
-            layout.sidebar,
-            self.workbench.is_focused(PaneId::Sidebar),
-            SidebarStyle::default(),
-        );
+        if layout.compact {
+            render_compact_workbench(frame, frame.area());
+            return;
+        }
+        if layout.sidebar.width > 0 && layout.sidebar.height > 0 {
+            render_sidebar(
+                frame,
+                layout.sidebar,
+                self.workbench.is_focused(PaneId::Sidebar),
+                SidebarStyle::default(),
+            );
+        }
 
         for (pane, area) in [
             (PaneId::Editor, layout.editor),
             (PaneId::Agent, layout.agent),
             (PaneId::Bottom, layout.bottom),
         ] {
-            if let Some(session) = self.sessions.get(&pane) {
+            if area.width >= MIN_TERMINAL_WIDTH
+                && area.height >= MIN_TERMINAL_HEIGHT
+                && let Some(session) = self.sessions.get(&pane)
+            {
                 render_session(
                     frame,
                     area,
@@ -602,7 +623,7 @@ fn edge_scroll_direction(layout: WorkbenchLayout, pane: PaneId, event: MouseEven
 }
 
 fn session_title(display_name: &str, status: Option<&str>, pane_width: u16) -> String {
-    let base_title = format!("ami-code {display_name} — Ctrl+Q to quit");
+    let base_title = display_name.to_string();
     let available = usize::from(pane_width.saturating_sub(2));
     let remaining = available.saturating_sub(base_title.chars().count() + 3);
     match status.filter(|status| !status.is_empty() && remaining > 0) {
@@ -721,13 +742,11 @@ mod tests {
     #[test]
     fn bounds_status_to_available_title_width() {
         assert_eq!(
-            session_title("pi", Some("clipboard unavailable"), 40),
-            "ami-code pi — Ctrl+Q to quit — clipbo…"
+            session_title("pi", Some("clipboard unavailable"), 20),
+            "pi — clipboard un…"
         );
-        assert_eq!(
-            session_title("pi", Some("ignored"), 20),
-            "ami-code pi — Ctrl+Q to quit"
-        );
+        assert_eq!(session_title("nvim", None, 20), "nvim");
+        assert!(!session_title("shell", None, 20).contains("Ctrl+Q"));
     }
 
     #[test]

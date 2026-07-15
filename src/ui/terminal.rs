@@ -24,6 +24,16 @@ pub fn terminal_content_size(area: Rect) -> TerminalSize {
     TerminalSize::new(area.width.saturating_sub(2), area.height.saturating_sub(2))
 }
 
+pub fn render_compact_workbench(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    // This view deliberately does not inspect a terminal screen. Sessions remain
+    // alive at their last valid size until enough room is available again.
+    frame.render_widget(
+        Paragraph::new("workbench needs at least 6 columns × 3 rows")
+            .style(Style::default().fg(Color::Yellow)),
+        area,
+    );
+}
+
 pub fn render_terminal_pane(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -181,7 +191,7 @@ mod tests {
         );
         assert_eq!(
             terminal_content_size(Rect::new(0, 0, 1, 1)),
-            TerminalSize::new(1, 1)
+            TerminalSize::new(2, 2)
         );
     }
 

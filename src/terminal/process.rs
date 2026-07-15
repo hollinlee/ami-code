@@ -15,9 +15,11 @@ pub struct TerminalSize {
 
 impl TerminalSize {
     pub fn new(cols: u16, rows: u16) -> Self {
+        // vt100 0.16 can underflow while wrapping/scrolling a 1-row or
+        // 1-column screen. Keep hidden/compact sessions at a parser-safe size.
         Self {
-            cols: cols.max(1),
-            rows: rows.max(1),
+            cols: cols.max(2),
+            rows: rows.max(2),
         }
     }
 }
@@ -159,5 +161,19 @@ fn to_pty_size(size: TerminalSize) -> PtySize {
         cols: size.cols,
         pixel_width: 0,
         pixel_height: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalSize;
+
+    #[test]
+    fn clamps_to_vt100_safe_minimum() {
+        assert_eq!(TerminalSize::new(0, 0), TerminalSize::new(2, 2));
+        assert_eq!(
+            (TerminalSize::new(1, 1).cols, TerminalSize::new(1, 1).rows),
+            (2, 2)
+        );
     }
 }

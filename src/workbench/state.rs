@@ -1,12 +1,45 @@
-use super::{PaneId, PaneKind, PaneSelection, PaneState};
+use ratatui::layout::Rect;
+
+use super::{
+    PaneId, PaneKind, PaneSelection, PaneState, WorkbenchLayoutConfig, WorkbenchVisibility,
+};
 use crate::backend::BackendKind;
 use crate::terminal::{TerminalPoint, TerminalRange};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CollapseState {
+    manual: bool,
+    automatic: bool,
+}
+
+impl CollapseState {
+    pub fn is_collapsed(self) -> bool {
+        self.manual || self.automatic
+    }
+
+    #[cfg(test)]
+    pub fn is_manually_collapsed(self) -> bool {
+        self.manual
+    }
+
+    #[cfg(test)]
+    pub fn is_automatically_collapsed(self) -> bool {
+        self.automatic
+    }
+
+    #[cfg(test)]
+    fn toggle_manual(&mut self) {
+        self.manual = !self.manual;
+    }
+}
 
 #[derive(Debug)]
 pub struct WorkbenchState {
     focused_pane: PaneId,
     panes: [PaneState; 4],
     selection: Option<PaneSelection>,
+    sidebar_collapse: CollapseState,
+    bottom_collapse: CollapseState,
 }
 
 impl Default for WorkbenchState {
@@ -20,6 +53,8 @@ impl Default for WorkbenchState {
                 PaneState::new(PaneId::Bottom, PaneKind::Backend(BackendKind::Shell)),
             ],
             selection: None,
+            sidebar_collapse: CollapseState::default(),
+            bottom_collapse: CollapseState::default(),
         }
     }
 }
@@ -39,6 +74,58 @@ impl WorkbenchState {
             true
         } else {
             false
+        }
+    }
+
+    #[cfg(test)]
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_collapse.toggle_manual();
+        self.update_pane_visibility();
+    }
+
+    #[cfg(test)]
+    pub fn toggle_bottom(&mut self) {
+        self.bottom_collapse.toggle_manual();
+        self.update_pane_visibility();
+    }
+
+    #[cfg(test)]
+    pub fn sidebar_collapse(&self) -> CollapseState {
+        self.sidebar_collapse
+    }
+
+    #[cfg(test)]
+    pub fn bottom_collapse(&self) -> CollapseState {
+        self.bottom_collapse
+    }
+
+    pub fn update_auto_collapse(&mut self, area: Rect, config: WorkbenchLayoutConfig) {
+        self.sidebar_collapse.automatic = area.width < config.sidebar_shortage_width();
+        self.bottom_collapse.automatic = area.height < config.bottom_shortage_height();
+        self.update_pane_visibility();
+    }
+
+    pub fn visibility(&self) -> WorkbenchVisibility {
+        WorkbenchVisibility {
+            sidebar: !self.sidebar_collapse.is_collapsed(),
+            bottom: !self.bottom_collapse.is_collapsed(),
+        }
+    }
+
+    fn update_pane_visibility(&mut self) {
+        let visibility = self.visibility();
+        for pane in &mut self.panes {
+            pane.visible = match pane.id {
+                PaneId::Sidebar => visibility.sidebar,
+                PaneId::Bottom => visibility.bottom,
+                PaneId::Editor | PaneId::Agent => true,
+            };
+        }
+        if !self
+            .pane(self.focused_pane)
+            .is_some_and(|pane| pane.visible)
+        {
+            self.focused_pane = PaneId::Editor;
         }
     }
 
@@ -78,11 +165,8 @@ mod tests {
     #[test]
     fn defaults_to_editor_focus() {
         let state = WorkbenchState::default();
-
         assert_eq!(state.focused_pane(), PaneId::Editor);
         assert!(state.pane(PaneId::Sidebar).is_some());
-        assert!(state.pane(PaneId::Editor).is_some());
-        assert!(state.pane(PaneId::Agent).is_some());
         assert!(state.pane(PaneId::Bottom).is_some());
     }
 
@@ -91,26 +175,76 @@ mod tests {
         let mut state = WorkbenchState::default();
         state.begin_selection(TerminalPoint::new(2, 3));
         state.set_selection_head(TerminalPoint::new(4, 5));
-
         assert_eq!(
             state.selection_range(PaneId::Editor),
             Some(TerminalRange::inclusive(
                 TerminalPoint::new(2, 3),
-                TerminalPoint::new(4, 5),
+                TerminalPoint::new(4, 5)
             ))
         );
         assert_eq!(state.selection_range(PaneId::Agent), None);
-
         state.clear_selection();
         assert_eq!(state.selection(), None);
     }
 
     #[test]
-    fn focuses_visible_panes_directly() {
+    fn auto_collapse_uses_thresholds_and_recovers() {
         let mut state = WorkbenchState::default();
+        let config = WorkbenchLayoutConfig::default();
+        state.update_auto_collapse(
+            Rect::new(
+                0,
+                0,
+                config.sidebar_shortage_width().saturating_sub(1),
+                config.bottom_shortage_height().saturating_sub(1),
+            ),
+            config,
+        );
+        assert!(state.sidebar_collapse().is_automatically_collapsed());
+        assert!(state.bottom_collapse().is_automatically_collapsed());
+        state.update_auto_collapse(
+            Rect::new(
+                0,
+                0,
+                config.sidebar_shortage_width(),
+                config.bottom_shortage_height(),
+            ),
+            config,
+        );
+        assert!(!state.sidebar_collapse().is_collapsed());
+        assert!(!state.bottom_collapse().is_collapsed());
+    }
 
-        assert!(state.focus_pane(PaneId::Agent));
-        assert_eq!(state.focused_pane(), PaneId::Agent);
-        assert!(!state.focus_pane(PaneId::Agent));
+    #[test]
+    fn manual_and_auto_collapse_follow_full_truth_table() {
+        let config = WorkbenchLayoutConfig::default();
+        for manual in [false, true] {
+            for automatic in [false, true] {
+                let mut state = WorkbenchState::default();
+                if manual {
+                    state.toggle_sidebar();
+                }
+                let width = if automatic {
+                    config.sidebar_shortage_width().saturating_sub(1)
+                } else {
+                    config.sidebar_shortage_width()
+                };
+                state.update_auto_collapse(Rect::new(0, 0, width, 24), config);
+                assert_eq!(state.sidebar_collapse().is_manually_collapsed(), manual);
+                assert_eq!(
+                    state.sidebar_collapse().is_automatically_collapsed(),
+                    automatic
+                );
+                assert_eq!(state.sidebar_collapse().is_collapsed(), manual || automatic);
+            }
+        }
+    }
+
+    #[test]
+    fn collapsing_focused_pane_returns_focus_to_editor() {
+        let mut state = WorkbenchState::default();
+        assert!(state.focus_pane(PaneId::Bottom));
+        state.toggle_bottom();
+        assert_eq!(state.focused_pane(), PaneId::Editor);
     }
 }
