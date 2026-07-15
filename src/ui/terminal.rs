@@ -34,6 +34,30 @@ pub fn render_compact_workbench(frame: &mut ratatui::Frame<'_>, area: Rect) {
     );
 }
 
+pub fn render_unavailable_terminal_pane(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    message: &str,
+    focused: bool,
+    pane_style: TerminalPaneStyle,
+) {
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused {
+            pane_style.focused_border
+        } else {
+            pane_style.unfocused_border
+        }));
+    frame.render_widget(
+        Paragraph::new(message)
+            .style(Style::default().fg(Color::Yellow))
+            .block(block),
+        area,
+    );
+}
+
 pub fn render_terminal_pane(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
