@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,14 +22,15 @@ use crate::ui::{
     SidebarStyle, TerminalPaneStyle, render_sidebar, render_terminal_pane, terminal_content_size,
 };
 use crate::workbench::{
-    Direction, Mode, MouseTarget, PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState,
-    hit_test,
+    MouseTarget, PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState, hit_test,
 };
 use crate::workspace::Workspace;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SCROLLBACK_LINES: usize = 1_000;
 const MOUSE_WHEEL_LINES: i32 = 3;
+const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+const EDGE_SCROLL_LINES: i32 = 1;
 
 pub fn run(mode: LaunchMode) -> Result<()> {
     let workspace = Workspace::discover(std::env::current_dir()?)?;
@@ -41,6 +43,7 @@ pub fn run(mode: LaunchMode) -> Result<()> {
         if runtime.has_exited_session()? {
             break;
         }
+        runtime.tick_mouse_selection();
 
         let area = terminal.terminal.size()?.into();
         runtime.resize(area)?;
@@ -58,7 +61,9 @@ pub fn run(mode: LaunchMode) -> Result<()> {
 struct PendingMouseGesture {
     target: MouseTarget,
     down: MouseEvent,
+    current: MouseEvent,
     dragging: bool,
+    next_edge_scroll: Instant,
 }
 
 struct AppRuntime {
@@ -162,6 +167,10 @@ impl AppRuntime {
     fn resize(&mut self, area: Rect) -> Result<()> {
         if self.launch_mode.is_workbench() {
             let layout = WorkbenchLayout::calculate(area, self.layout_config);
+            if self.layout != Some(layout) {
+                self.pending_mouse = None;
+                self.clear_selection();
+            }
             for (pane, pane_area) in [
                 (PaneId::Editor, layout.editor),
                 (PaneId::Agent, layout.agent),
@@ -201,7 +210,6 @@ impl AppRuntime {
             frame,
             layout.sidebar,
             self.workbench.is_focused(PaneId::Sidebar),
-            self.workbench.mode(),
             SidebarStyle::default(),
         );
 
@@ -230,19 +238,30 @@ impl AppRuntime {
                 if is_quit(key) {
                     return Ok(false);
                 }
+                if should_copy_selection(key, self.workbench.selection().is_some()) {
+                    self.copy_selection();
+                    return Ok(true);
+                }
+                if is_system_paste(key) {
+                    self.clear_selection();
+                    self.paste_system_clipboard();
+                    return Ok(true);
+                }
 
-                if self.launch_mode.is_workbench() {
-                    self.handle_workbench_key(key)?;
-                } else if let Some(session) = self.sessions.get_mut(&PaneId::Editor) {
+                self.clear_selection();
+                let pane = if self.launch_mode.is_workbench() {
+                    self.workbench.focused_pane()
+                } else {
+                    PaneId::Editor
+                };
+                if let Some(session) = self.sessions.get_mut(&pane) {
                     session.send_key(key)?;
                 }
             }
             Event::Paste(contents) => {
-                if self.launch_mode.is_workbench() && self.workbench.mode() != Mode::Edit {
-                    self.set_status("paste is only available in Edit mode");
-                } else {
-                    self.paste_into_focused(&contents);
-                }
+                self.pending_mouse = None;
+                self.clear_selection();
+                self.paste_into_focused(&contents);
             }
             Event::Mouse(mouse) if self.launch_mode.is_workbench() => {
                 self.handle_mouse_event(mouse)?;
@@ -253,118 +272,8 @@ impl AppRuntime {
         Ok(true)
     }
 
-    fn handle_workbench_key(&mut self, key: KeyEvent) -> Result<()> {
-        if let Some(direction) = global_focus_direction(key) {
-            if self.workbench.focus(direction) && self.workbench.mode() == Mode::View {
-                self.begin_view_selection();
-            }
-            return Ok(());
-        }
-
-        if is_control_toggle(key) {
-            if self.workbench.mode() == Mode::View {
-                self.leave_view_mode(Mode::Control);
-            } else {
-                self.workbench.toggle_control_mode();
-            }
-            return Ok(());
-        }
-
-        match self.workbench.mode() {
-            Mode::Edit => {
-                if let Some(session) = self.sessions.get_mut(&self.workbench.focused_pane()) {
-                    session.send_key(key)?;
-                }
-            }
-            Mode::Control => match key.code {
-                KeyCode::Esc => self.workbench.set_mode(Mode::Edit),
-                KeyCode::Char('p') => self.paste_system_clipboard(),
-                KeyCode::Char('v') => self.begin_view_selection(),
-                code => {
-                    if let Some(direction) = direction_for_key(code) {
-                        self.workbench.focus(direction);
-                    }
-                }
-            },
-            Mode::View => self.handle_view_key(key),
-        }
-
-        Ok(())
-    }
-
-    fn handle_view_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => self.leave_view_mode(Mode::Edit),
-            KeyCode::Char('y') => self.yank_selection(),
-            KeyCode::Char('h') => self.move_selection(0, -1),
-            KeyCode::Char('j') => self.move_selection(1, 0),
-            KeyCode::Char('k') => self.move_selection(-1, 0),
-            KeyCode::Char('l') => self.move_selection(0, 1),
-            KeyCode::Char('0') => self.move_selection_to_line_edge(false),
-            KeyCode::Char('$') => self.move_selection_to_line_edge(true),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.page_selection(-1, false);
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.page_selection(1, false);
-            }
-            KeyCode::PageUp => self.page_selection(-1, true),
-            KeyCode::PageDown => self.page_selection(1, true),
-            _ => {}
-        }
-    }
-
-    fn begin_view_selection(&mut self) {
-        let pane = self.workbench.focused_pane();
-        let Some(session) = self.sessions.get_mut(&pane) else {
-            self.workbench.clear_selection();
-            self.workbench.set_mode(Mode::Control);
-            self.set_status("focused pane does not support text selection");
-            return;
-        };
-        let anchor = session.selection_cursor();
-        self.workbench.begin_selection(anchor);
-        self.workbench.set_mode(Mode::View);
-        self.status = None;
-    }
-
-    fn move_selection(&mut self, row_delta: i64, col_delta: i32) {
+    fn copy_selection(&mut self) {
         let Some(selection) = self.workbench.selection() else {
-            return;
-        };
-        let Some(session) = self.sessions.get_mut(&selection.pane()) else {
-            return;
-        };
-        let head = session.move_selection_point(selection.head(), row_delta, col_delta);
-        self.workbench.set_selection_head(head);
-    }
-
-    fn move_selection_to_line_edge(&mut self, end: bool) {
-        let Some(selection) = self.workbench.selection() else {
-            return;
-        };
-        let Some(session) = self.sessions.get_mut(&selection.pane()) else {
-            return;
-        };
-        let head = session.move_selection_to_line_edge(selection.head(), end);
-        self.workbench.set_selection_head(head);
-    }
-
-    fn page_selection(&mut self, direction: i64, full_page: bool) {
-        let Some(selection) = self.workbench.selection() else {
-            return;
-        };
-        let Some(session) = self.sessions.get_mut(&selection.pane()) else {
-            return;
-        };
-        let delta = session.page_rows(full_page).saturating_mul(direction);
-        let head = session.move_selection_point(selection.head(), delta, 0);
-        self.workbench.set_selection_head(head);
-    }
-
-    fn yank_selection(&mut self) {
-        let Some(selection) = self.workbench.selection() else {
-            self.set_status("no active selection");
             return;
         };
         let Some(session) = self.sessions.get(&selection.pane()) else {
@@ -373,22 +282,18 @@ impl AppRuntime {
         };
         let contents = session.selected_text(selection.range());
         match crate::clipboard::write_system(&contents) {
-            Ok(()) => {
-                self.status = None;
-                self.leave_view_mode(Mode::Control);
-            }
+            Ok(()) => self.status = None,
             Err(error) => self.set_status(format!("clipboard error: {error}")),
         }
     }
 
-    fn leave_view_mode(&mut self, next_mode: Mode) {
+    fn clear_selection(&mut self) {
         if let Some(selection) = self.workbench.selection()
             && let Some(session) = self.sessions.get_mut(&selection.pane())
         {
             session.reset_scrollback();
         }
         self.workbench.clear_selection();
-        self.workbench.set_mode(next_mode);
     }
 
     fn handle_mouse_event(&mut self, event: MouseEvent) -> Result<()> {
@@ -402,11 +307,14 @@ impl AppRuntime {
                 let Some(target) = target else {
                     return Ok(());
                 };
-                self.focus_mouse_target(target);
+                self.clear_selection();
+                self.workbench.focus_pane(target.pane());
                 self.pending_mouse = Some(PendingMouseGesture {
                     target,
                     down: event,
+                    current: event,
                     dragging: false,
+                    next_edge_scroll: Instant::now() + EDGE_SCROLL_INTERVAL,
                 });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -416,17 +324,19 @@ impl AppRuntime {
                 if !pending.dragging {
                     pending.dragging = self.begin_mouse_selection(pending.target);
                 }
+                pending.current = event;
                 if pending.dragging {
-                    self.update_mouse_selection(target);
+                    self.update_mouse_selection(event);
                 }
                 self.pending_mouse = Some(pending);
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let Some(pending) = self.pending_mouse.take() else {
+                let Some(mut pending) = self.pending_mouse.take() else {
                     return Ok(());
                 };
+                pending.current = event;
                 if pending.dragging {
-                    self.update_mouse_selection(target);
+                    self.update_mouse_selection(event);
                 } else {
                     self.finish_mouse_click(pending, event)?;
                 }
@@ -442,50 +352,71 @@ impl AppRuntime {
         Ok(())
     }
 
-    fn focus_mouse_target(&mut self, target: MouseTarget) {
-        let previous_selection = self.workbench.selection();
-        if self.workbench.focus_pane(target.pane()) && self.workbench.mode() == Mode::View {
-            if let Some(selection) = previous_selection
-                && let Some(session) = self.sessions.get_mut(&selection.pane())
-            {
-                session.reset_scrollback();
-            }
-            self.workbench.clear_selection();
-            if !matches!(target, MouseTarget::Content { .. }) {
-                self.workbench.set_mode(Mode::Control);
-            }
-        }
-    }
-
     fn begin_mouse_selection(&mut self, target: MouseTarget) -> bool {
         let MouseTarget::Content { pane, row, col } = target else {
             return false;
         };
-        let Some(session) = self.sessions.get(&pane) else {
+        let Some(session) = self.sessions.get_mut(&pane) else {
             return false;
         };
-        let anchor = session.viewport_point(row, col);
-        self.workbench.begin_selection(anchor);
-        self.workbench.set_mode(Mode::View);
+        session.begin_selection_view();
+        self.workbench
+            .begin_selection(session.viewport_point(row, col));
         self.status = None;
         true
     }
 
-    fn update_mouse_selection(&mut self, target: Option<MouseTarget>) {
+    fn update_mouse_selection(&mut self, event: MouseEvent) {
+        let Some(layout) = self.layout else {
+            return;
+        };
         let Some(selection) = self.workbench.selection() else {
             return;
         };
-        let Some(MouseTarget::Content { pane, row, col }) = target else {
+        let pane = selection.pane();
+        let Some((row, col)) = pointer_content_position(layout, pane, event) else {
             return;
         };
-        if pane != selection.pane() {
-            return;
-        }
         let Some(session) = self.sessions.get(&pane) else {
             return;
         };
         self.workbench
             .set_selection_head(session.viewport_point(row, col));
+    }
+
+    fn tick_mouse_selection(&mut self) {
+        let Some(mut pending) = self.pending_mouse else {
+            return;
+        };
+        let now = Instant::now();
+        if !pending.dragging || now < pending.next_edge_scroll {
+            return;
+        }
+        pending.next_edge_scroll = now + EDGE_SCROLL_INTERVAL;
+        self.pending_mouse = Some(pending);
+
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let Some(selection) = self.workbench.selection() else {
+            return;
+        };
+        let pane = selection.pane();
+        let direction = edge_scroll_direction(layout, pane, pending.current);
+        if direction == 0 {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(&pane) else {
+            return;
+        };
+        if !session.scroll_viewport(direction * EDGE_SCROLL_LINES) {
+            return;
+        }
+        let Some((row, col)) = pointer_content_position(layout, pane, pending.current) else {
+            return;
+        };
+        let head = session.viewport_point(row, col);
+        self.workbench.set_selection_head(head);
     }
 
     fn finish_mouse_click(
@@ -496,23 +427,15 @@ impl AppRuntime {
         let MouseTarget::Content { pane, row, col } = pending.target else {
             return Ok(());
         };
-        if self.workbench.mode() == Mode::View {
-            let Some(session) = self.sessions.get(&pane) else {
-                return Ok(());
-            };
-            self.workbench
-                .begin_selection(session.viewport_point(row, col));
-            return Ok(());
-        }
-        if self.workbench.mode() != Mode::Edit {
-            return Ok(());
-        }
-
         let Some(session) = self.sessions.get_mut(&pane) else {
             return Ok(());
         };
+        let (release_row, release_col) = self
+            .layout
+            .and_then(|layout| pointer_content_position(layout, pane, release))
+            .unwrap_or((row, col));
         session.send_mouse(mouse_at(pending.down, row, col))?;
-        session.send_mouse(mouse_at(release, row, col))?;
+        session.send_mouse(mouse_at(release, release_row, release_col))?;
         Ok(())
     }
 
@@ -524,9 +447,7 @@ impl AppRuntime {
         let Some(MouseTarget::Content { pane, row, col }) = target else {
             return Ok(());
         };
-        if self.workbench.mode() == Mode::Edit
-            && let Some(session) = self.sessions.get_mut(&pane)
-        {
+        if let Some(session) = self.sessions.get_mut(&pane) {
             session.send_mouse(mouse_at(event, row, col))?;
         }
         Ok(())
@@ -536,6 +457,10 @@ impl AppRuntime {
         let Some(MouseTarget::Content { pane, row, col }) = target else {
             return Ok(());
         };
+        let selection_owns_wheel = self
+            .workbench
+            .selection()
+            .is_some_and(|selection| selection.pane() == pane);
         let Some(session) = self.sessions.get_mut(&pane) else {
             return Ok(());
         };
@@ -546,14 +471,12 @@ impl AppRuntime {
             _ => return Ok(()),
         };
 
-        match self.workbench.mode() {
-            Mode::View if lines != 0 => session.scroll_viewport(lines),
-            Mode::View => {}
-            Mode::Edit if session.mouse_reporting() => {
-                session.send_mouse(mouse_at(event, row, col))?;
-            }
-            Mode::Edit if lines != 0 => session.scroll_viewport(lines),
-            Mode::Edit | Mode::Control => {}
+        if selection_owns_wheel && lines != 0 {
+            session.scroll_viewport(lines);
+        } else if session.mouse_reporting() {
+            session.send_mouse(mouse_at(event, row, col))?;
+        } else if lines != 0 {
+            session.scroll_viewport(lines);
         }
         Ok(())
     }
@@ -636,6 +559,48 @@ fn mouse_at(mut event: MouseEvent, row: u16, col: u16) -> MouseEvent {
     event
 }
 
+fn pane_area(layout: WorkbenchLayout, pane: PaneId) -> Option<Rect> {
+    match pane {
+        PaneId::Editor => Some(layout.editor),
+        PaneId::Agent => Some(layout.agent),
+        PaneId::Bottom => Some(layout.bottom),
+        PaneId::Sidebar => None,
+    }
+}
+
+fn pointer_content_position(
+    layout: WorkbenchLayout,
+    pane: PaneId,
+    event: MouseEvent,
+) -> Option<(u16, u16)> {
+    let area = pane_area(layout, pane)?;
+    let size = terminal_content_size(area);
+    let row = event
+        .row
+        .saturating_sub(area.y.saturating_add(1))
+        .min(size.rows.saturating_sub(1));
+    let col = event
+        .column
+        .saturating_sub(area.x.saturating_add(1))
+        .min(size.cols.saturating_sub(1));
+    Some((row, col))
+}
+
+fn edge_scroll_direction(layout: WorkbenchLayout, pane: PaneId, event: MouseEvent) -> i32 {
+    let Some(area) = pane_area(layout, pane) else {
+        return 0;
+    };
+    let content_top = area.y.saturating_add(1);
+    let content_bottom = area.bottom().saturating_sub(2);
+    if event.row <= content_top {
+        1
+    } else if event.row >= content_bottom {
+        -1
+    } else {
+        0
+    }
+}
+
 fn session_title(display_name: &str, status: Option<&str>, pane_width: u16) -> String {
     let base_title = format!("ami-code {display_name} — Ctrl+Q to quit");
     let available = usize::from(pane_width.saturating_sub(2));
@@ -663,26 +628,14 @@ fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-fn global_focus_direction(key: KeyEvent) -> Option<Direction> {
-    key.modifiers
-        .contains(KeyModifiers::CONTROL)
-        .then(|| direction_for_key(key.code))
-        .flatten()
+fn should_copy_selection(key: KeyEvent, has_selection: bool) -> bool {
+    key.code == KeyCode::Char('c')
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || (has_selection && key.modifiers.contains(KeyModifiers::CONTROL)))
 }
 
-fn direction_for_key(code: KeyCode) -> Option<Direction> {
-    match code {
-        KeyCode::Char('h') => Some(Direction::Left),
-        KeyCode::Char('j') => Some(Direction::Down),
-        KeyCode::Char('k') => Some(Direction::Up),
-        KeyCode::Char('l') => Some(Direction::Right),
-        _ => None,
-    }
-}
-
-fn is_control_toggle(key: KeyEvent) -> bool {
-    (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
-        || key.code == KeyCode::Null
+fn is_system_paste(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SUPER)
 }
 
 struct TerminalGuard {
@@ -711,6 +664,7 @@ impl Drop for TerminalGuard {
 struct TerminalStateGuard {
     alternate_screen: bool,
     bracketed_paste: bool,
+    keyboard_enhancement: bool,
     mouse_capture: bool,
 }
 
@@ -720,6 +674,7 @@ impl TerminalStateGuard {
         let mut state = Self {
             alternate_screen: false,
             bracketed_paste: false,
+            keyboard_enhancement: false,
             mouse_capture: false,
         };
         let mut stdout = std::io::stdout();
@@ -728,6 +683,12 @@ impl TerminalStateGuard {
         execute!(stdout, EnableBracketedPaste).context("failed to enable bracketed paste")?;
         state.bracketed_paste = true;
         if capture_mouse {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,)
+            )
+            .context("failed to enable keyboard enhancement")?;
+            state.keyboard_enhancement = true;
             execute!(stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
             state.mouse_capture = true;
         }
@@ -739,6 +700,9 @@ impl Drop for TerminalStateGuard {
     fn drop(&mut self) {
         if self.mouse_capture {
             let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
+        if self.keyboard_enhancement {
+            let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
         }
         if self.bracketed_paste {
             let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -767,14 +731,41 @@ mod tests {
     }
 
     #[test]
-    fn maps_vim_focus_keys() {
-        assert_eq!(direction_for_key(KeyCode::Char('h')), Some(Direction::Left));
-        assert_eq!(direction_for_key(KeyCode::Char('j')), Some(Direction::Down));
-        assert_eq!(direction_for_key(KeyCode::Char('k')), Some(Direction::Up));
+    fn recognizes_system_clipboard_keys() {
+        assert!(should_copy_selection(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+            false,
+        ));
+        assert!(should_copy_selection(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            true,
+        ));
+        assert!(is_system_paste(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!should_copy_selection(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+        ));
+    }
+
+    #[test]
+    fn detects_vertical_selection_edges() {
+        let layout =
+            WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), WorkbenchLayoutConfig::default());
+        let event = |row| MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: layout.editor.x + 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(edge_scroll_direction(layout, PaneId::Editor, event(1)), 1);
+        assert_eq!(edge_scroll_direction(layout, PaneId::Editor, event(10)), 0);
         assert_eq!(
-            direction_for_key(KeyCode::Char('l')),
-            Some(Direction::Right)
+            edge_scroll_direction(layout, PaneId::Editor, event(layout.editor.bottom() - 2)),
+            -1
         );
-        assert_eq!(direction_for_key(KeyCode::Char('x')), None);
     }
 }
