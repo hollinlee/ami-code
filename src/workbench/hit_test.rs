@@ -36,24 +36,33 @@ impl MouseTarget {
     }
 }
 
+pub fn layout_handle_position(layout: WorkbenchLayout, handle: LayoutHandle) -> (u16, u16) {
+    match handle {
+        LayoutHandle::Sidebar if layout.sidebar.width > 0 => {
+            (layout.sidebar.x.saturating_add(1), layout.sidebar.y)
+        }
+        LayoutHandle::Sidebar => (layout.editor.x, layout.editor.y),
+        LayoutHandle::Bottom if layout.bottom.height > 0 => {
+            (layout.bottom.x.saturating_add(1), layout.bottom.y)
+        }
+        LayoutHandle::Bottom => (
+            layout.editor.x.saturating_add(layout.editor.width / 2),
+            layout.editor.bottom().saturating_sub(1),
+        ),
+    }
+}
+
 pub fn hit_test(layout: WorkbenchLayout, column: u16, row: u16) -> Option<MouseTarget> {
     if layout.compact {
         return None;
     }
 
     // Handles are tested before dividers so their click target remains exact.
-    let sidebar_x = layout.editor.x;
-    if column == sidebar_x && row == layout.editor.y {
-        return Some(MouseTarget::Handle(LayoutHandle::Sidebar));
-    }
-    let bottom_y = if layout.bottom.height > 0 {
-        layout.bottom.y
-    } else {
-        layout.editor.bottom().saturating_sub(1)
-    };
-    let bottom_x = layout.editor.x.saturating_add(layout.editor.width / 2);
-    if column == bottom_x && row == bottom_y {
-        return Some(MouseTarget::Handle(LayoutHandle::Bottom));
+    for handle in [LayoutHandle::Sidebar, LayoutHandle::Bottom] {
+        let (handle_x, handle_y) = layout_handle_position(layout, handle);
+        if column == handle_x && row == handle_y {
+            return Some(MouseTarget::Handle(handle));
+        }
     }
 
     if layout.sidebar.width > 0
@@ -135,8 +144,12 @@ mod tests {
     fn chrome_has_priority_and_handles_have_priority_over_dividers() {
         let layout = layout();
         assert_eq!(
-            hit_test(layout, layout.editor.x, layout.editor.y),
+            hit_test(layout, layout.sidebar.x + 1, layout.sidebar.y),
             Some(MouseTarget::Handle(LayoutHandle::Sidebar))
+        );
+        assert_eq!(
+            hit_test(layout, layout.bottom.x + 1, layout.bottom.y),
+            Some(MouseTarget::Handle(LayoutHandle::Bottom))
         );
         assert_eq!(
             hit_test(layout, layout.editor.x, 2),
@@ -162,17 +175,12 @@ mod tests {
                 bottom: false,
             },
         );
-        assert_eq!(
-            hit_test(layout, layout.editor.x, layout.editor.y),
-            Some(MouseTarget::Handle(LayoutHandle::Sidebar))
-        );
-        assert_eq!(
-            hit_test(
-                layout,
-                layout.editor.x + layout.editor.width / 2,
-                layout.editor.bottom() - 1
-            ),
-            Some(MouseTarget::Handle(LayoutHandle::Bottom))
-        );
+        for handle in [LayoutHandle::Sidebar, LayoutHandle::Bottom] {
+            let (column, row) = layout_handle_position(layout, handle);
+            assert_eq!(
+                hit_test(layout, column, row),
+                Some(MouseTarget::Handle(handle))
+            );
+        }
     }
 }

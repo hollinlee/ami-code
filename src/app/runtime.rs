@@ -619,6 +619,9 @@ impl AppRuntime {
         focused: bool,
         selection: Option<crate::terminal::TerminalRange>,
     ) {
+        let title_handle = self.launch_mode.is_workbench()
+            && pane == PaneId::Bottom
+            && self.layout.is_some_and(|layout| layout.bottom.height > 0);
         if let Some(session) = self.sessions.get(&pane) {
             render_session(
                 frame,
@@ -627,6 +630,7 @@ impl AppRuntime {
                 focused,
                 selection,
                 self.status.as_deref(),
+                title_handle,
             );
             return;
         }
@@ -640,7 +644,8 @@ impl AppRuntime {
             .get(&pane)
             .map(|slot| slot.spec.display_name.as_str())
             .unwrap_or("backend");
-        let title = session_title(display_name, Some(&status), area.width);
+        let title =
+            session_title_with_handle(display_name, Some(&status), area.width, title_handle);
         render_unavailable_terminal_pane(
             frame,
             area,
@@ -1026,8 +1031,9 @@ fn render_session(
     focused: bool,
     selection: Option<crate::terminal::TerminalRange>,
     status: Option<&str>,
+    title_handle: bool,
 ) {
-    let title = session_title(session.display_name(), status, area.width);
+    let title = session_title_with_handle(session.display_name(), status, area.width, title_handle);
     render_terminal_pane(
         frame,
         area,
@@ -1154,6 +1160,25 @@ fn edge_scroll_direction(layout: WorkbenchLayout, pane: PaneId, event: MouseEven
         -1
     } else {
         0
+    }
+}
+
+fn session_title_with_handle(
+    display_name: &str,
+    status: Option<&str>,
+    pane_width: u16,
+    title_handle: bool,
+) -> String {
+    let title_width = if title_handle {
+        pane_width.saturating_sub(2)
+    } else {
+        pane_width
+    };
+    let title = session_title(display_name, status, title_width);
+    if title_handle {
+        format!("  {title}")
+    } else {
+        title
     }
 }
 
@@ -1345,6 +1370,10 @@ mod tests {
             "pi — clipboard un…"
         );
         assert_eq!(session_title("nvim", None, 20), "nvim");
+        assert_eq!(
+            session_title_with_handle("shell", None, 20, true),
+            "  shell"
+        );
         assert!(!session_title("shell", None, 20).contains("Ctrl+Q"));
     }
 
