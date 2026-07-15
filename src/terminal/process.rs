@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -64,7 +65,7 @@ impl ProcessSpec {
 pub struct PtyProcess {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send>,
+    child: Option<Box<dyn portable_pty::Child + Send>>,
     rx: Receiver<Vec<u8>>,
 }
 
@@ -90,14 +91,20 @@ impl PtyProcess {
             .with_context(|| format!("failed to spawn {}", spec.display_name))?;
         drop(pair.slave);
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                terminate_and_reap(child);
+                return Err(error).context("failed to clone PTY reader");
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                terminate_and_reap(child);
+                return Err(error).context("failed to take PTY writer");
+            }
+        };
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -118,7 +125,7 @@ impl PtyProcess {
         Ok(Self {
             master: pair.master,
             writer,
-            child,
+            child: Some(child),
             rx,
         })
     }
@@ -144,14 +151,46 @@ impl PtyProcess {
     }
 
     pub fn has_exited(&mut self) -> Result<bool> {
-        self.child
+        let Some(child) = self.child.as_mut() else {
+            return Ok(true);
+        };
+        child
             .try_wait()
             .map(|status| status.is_some())
             .context("failed to poll PTY child")
     }
 
     pub fn terminate(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.take() {
+            terminate_and_reap(child);
+        }
+    }
+}
+
+fn terminate_and_reap(mut child: Box<dyn portable_pty::Child + Send>) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let _ = child.kill();
+
+    // Keep foreground teardown bounded. If the backend does not become
+    // waitable promptly, transfer ownership to a waiter so it is eventually
+    // reaped without blocking terminal restoration.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+impl Drop for PtyProcess {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -166,7 +205,7 @@ fn to_pty_size(size: TerminalSize) -> PtySize {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalSize;
+    use super::{ProcessSpec, PtyProcess, TerminalSize};
 
     #[test]
     fn clamps_to_vt100_safe_minimum() {
@@ -175,5 +214,17 @@ mod tests {
             (TerminalSize::new(1, 1).cols, TerminalSize::new(1, 1).rows),
             (2, 2)
         );
+    }
+
+    #[test]
+    fn termination_is_bounded_and_idempotent() {
+        let mut spec = ProcessSpec::new("/bin/sh");
+        spec.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        let mut process = PtyProcess::spawn(&spec, TerminalSize::new(20, 5)).unwrap();
+
+        process.terminate();
+        process.terminate();
+
+        assert!(process.has_exited().unwrap());
     }
 }
