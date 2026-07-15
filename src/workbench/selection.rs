@@ -22,10 +22,6 @@ impl PaneSelection {
         self.pane
     }
 
-    pub fn head(self) -> TerminalPoint {
-        self.head
-    }
-
     pub fn set_head(&mut self, head: TerminalPoint) {
         self.head = head;
     }
@@ -46,7 +42,6 @@ mod tests {
         selection.set_head(TerminalPoint::new(0, 4));
 
         assert_eq!(selection.pane(), PaneId::Editor);
-        assert_eq!(selection.head(), TerminalPoint::new(0, 4));
         assert_eq!(selection.range().start, TerminalPoint::new(0, 4));
         assert_eq!(selection.range().end, anchor);
     }

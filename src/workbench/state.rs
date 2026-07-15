@@ -1,11 +1,9 @@
-use super::{Direction, FocusGraph, Mode, PaneId, PaneKind, PaneSelection, PaneState};
+use super::{PaneId, PaneKind, PaneSelection, PaneState};
 use crate::backend::BackendKind;
 use crate::terminal::{TerminalPoint, TerminalRange};
 
 #[derive(Debug)]
 pub struct WorkbenchState {
-    mode: Mode,
-    focus_graph: FocusGraph,
     focused_pane: PaneId,
     panes: [PaneState; 4],
     selection: Option<PaneSelection>,
@@ -14,8 +12,6 @@ pub struct WorkbenchState {
 impl Default for WorkbenchState {
     fn default() -> Self {
         Self {
-            mode: Mode::Edit,
-            focus_graph: FocusGraph,
             focused_pane: PaneId::Editor,
             panes: [
                 PaneState::new(PaneId::Sidebar, PaneKind::Sidebar),
@@ -29,32 +25,12 @@ impl Default for WorkbenchState {
 }
 
 impl WorkbenchState {
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-    }
-
-    pub fn toggle_control_mode(&mut self) {
-        self.mode = match self.mode {
-            Mode::Control => Mode::Edit,
-            Mode::Edit | Mode::View => Mode::Control,
-        };
-    }
-
     pub fn focused_pane(&self) -> PaneId {
         self.focused_pane
     }
 
     pub fn is_focused(&self, pane: PaneId) -> bool {
         self.focused_pane == pane
-    }
-
-    pub fn focus(&mut self, direction: Direction) -> bool {
-        let target = self.focus_graph.next(self.focused_pane, direction);
-        self.focus_pane(target)
     }
 
     pub fn focus_pane(&mut self, target: PaneId) -> bool {
@@ -100,10 +76,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_editor_in_edit_mode() {
+    fn defaults_to_editor_focus() {
         let state = WorkbenchState::default();
 
-        assert_eq!(state.mode(), Mode::Edit);
         assert_eq!(state.focused_pane(), PaneId::Editor);
         assert!(state.pane(PaneId::Sidebar).is_some());
         assert!(state.pane(PaneId::Editor).is_some());
@@ -131,16 +106,11 @@ mod tests {
     }
 
     #[test]
-    fn moves_focus_through_graph() {
+    fn focuses_visible_panes_directly() {
         let mut state = WorkbenchState::default();
 
-        state.focus(Direction::Right);
+        assert!(state.focus_pane(PaneId::Agent));
         assert_eq!(state.focused_pane(), PaneId::Agent);
-        state.focus(Direction::Left);
-        state.focus(Direction::Down);
-        assert_eq!(state.focused_pane(), PaneId::Bottom);
-        state.focus(Direction::Up);
-        state.focus(Direction::Left);
-        assert_eq!(state.focused_pane(), PaneId::Sidebar);
+        assert!(!state.focus_pane(PaneId::Agent));
     }
 }

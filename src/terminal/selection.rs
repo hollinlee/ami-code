@@ -72,23 +72,6 @@ pub fn normalize_point(
     point
 }
 
-pub fn line_end(screen: &vt100::Screen, point: TerminalPoint) -> u16 {
-    let max_history = max_scrollback(screen);
-    let mut snapshot = screen.clone();
-    let Some(visible_row) = reveal_history_row(&mut snapshot, point.row, max_history) else {
-        return 0;
-    };
-    let (_, cols) = snapshot.size();
-    (0..cols)
-        .rev()
-        .find(|col| {
-            snapshot
-                .cell(visible_row, *col)
-                .is_some_and(vt100::Cell::has_contents)
-        })
-        .unwrap_or(0)
-}
-
 pub fn extract(screen: &vt100::Screen, range: TerminalRange) -> String {
     let max_history = max_scrollback(screen);
     let mut snapshot = screen.clone();
