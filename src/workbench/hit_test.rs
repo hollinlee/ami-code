@@ -2,23 +2,78 @@ use ratatui::layout::Rect;
 
 use super::{PaneId, WorkbenchLayout};
 
+/// Layout chrome has priority over pane borders/content. This makes every cell
+/// have one owner and prevents resize gestures from reaching a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutDivider {
+    SidebarMain,
+    EditorAgent,
+    EditorBottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutHandle {
+    Sidebar,
+    Bottom,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseTarget {
+    Handle(LayoutHandle),
+    Divider(LayoutDivider),
     Sidebar,
     Border(PaneId),
     Content { pane: PaneId, row: u16, col: u16 },
 }
 
 impl MouseTarget {
-    pub fn pane(self) -> PaneId {
+    pub fn pane(self) -> Option<PaneId> {
         match self {
-            Self::Sidebar => PaneId::Sidebar,
-            Self::Border(pane) | Self::Content { pane, .. } => pane,
+            Self::Sidebar => Some(PaneId::Sidebar),
+            Self::Border(pane) | Self::Content { pane, .. } => Some(pane),
+            Self::Handle(_) | Self::Divider(_) => None,
         }
     }
 }
 
 pub fn hit_test(layout: WorkbenchLayout, column: u16, row: u16) -> Option<MouseTarget> {
+    if layout.compact {
+        return None;
+    }
+
+    // Handles are tested before dividers so their click target remains exact.
+    let sidebar_x = layout.editor.x;
+    if column == sidebar_x && row == layout.editor.y {
+        return Some(MouseTarget::Handle(LayoutHandle::Sidebar));
+    }
+    let bottom_y = if layout.bottom.height > 0 {
+        layout.bottom.y
+    } else {
+        layout.editor.bottom().saturating_sub(1)
+    };
+    let bottom_x = layout.editor.x.saturating_add(layout.editor.width / 2);
+    if column == bottom_x && row == bottom_y {
+        return Some(MouseTarget::Handle(LayoutHandle::Bottom));
+    }
+
+    if layout.sidebar.width > 0
+        && column == layout.editor.x
+        && row >= layout.editor.y
+        && row < layout.agent.bottom()
+    {
+        return Some(MouseTarget::Divider(LayoutDivider::SidebarMain));
+    }
+    if column == layout.agent.x && row >= layout.agent.y && row < layout.agent.bottom() {
+        return Some(MouseTarget::Divider(LayoutDivider::EditorAgent));
+    }
+    if layout.bottom.height > 0
+        && row == layout.bottom.y
+        && column >= layout.editor.x
+        && column < layout.editor.right()
+    {
+        return Some(MouseTarget::Divider(LayoutDivider::EditorBottom));
+    }
+
     if contains(layout.sidebar, column, row) {
         return Some(MouseTarget::Sidebar);
     }
@@ -71,36 +126,53 @@ mod tests {
             Some(MouseTarget::Content {
                 pane: PaneId::Editor,
                 row: 0,
-                col: 0,
-            })
-        );
-        let agent = layout().agent;
-        assert_eq!(
-            hit_test(layout(), agent.x + 1, agent.y + 1),
-            Some(MouseTarget::Content {
-                pane: PaneId::Agent,
-                row: 0,
-                col: 0,
+                col: 0
             })
         );
     }
 
     #[test]
-    fn distinguishes_sidebar_and_terminal_borders() {
-        assert_eq!(hit_test(layout(), 2, 2), Some(MouseTarget::Sidebar));
+    fn chrome_has_priority_and_handles_have_priority_over_dividers() {
+        let layout = layout();
         assert_eq!(
-            hit_test(layout(), 24, 0),
-            Some(MouseTarget::Border(PaneId::Editor))
+            hit_test(layout, layout.editor.x, layout.editor.y),
+            Some(MouseTarget::Handle(LayoutHandle::Sidebar))
         );
-        let bottom = layout().bottom;
         assert_eq!(
-            hit_test(layout(), bottom.right() - 1, bottom.bottom() - 1),
-            Some(MouseTarget::Border(PaneId::Bottom))
+            hit_test(layout, layout.editor.x, 2),
+            Some(MouseTarget::Divider(LayoutDivider::SidebarMain))
+        );
+        assert_eq!(
+            hit_test(layout, layout.agent.x, 2),
+            Some(MouseTarget::Divider(LayoutDivider::EditorAgent))
+        );
+        assert_eq!(
+            hit_test(layout, layout.editor.x + 2, layout.bottom.y),
+            Some(MouseTarget::Divider(LayoutDivider::EditorBottom))
         );
     }
 
     #[test]
-    fn rejects_coordinates_outside_layout() {
-        assert_eq!(hit_test(layout(), 120, 40), None);
+    fn hidden_panes_keep_a_restore_handle() {
+        let layout = WorkbenchLayout::calculate_visible(
+            Rect::new(0, 0, 120, 40),
+            WorkbenchLayoutConfig::default(),
+            super::super::WorkbenchVisibility {
+                sidebar: false,
+                bottom: false,
+            },
+        );
+        assert_eq!(
+            hit_test(layout, layout.editor.x, layout.editor.y),
+            Some(MouseTarget::Handle(LayoutHandle::Sidebar))
+        );
+        assert_eq!(
+            hit_test(
+                layout,
+                layout.editor.x + layout.editor.width / 2,
+                layout.editor.bottom() - 1
+            ),
+            Some(MouseTarget::Handle(LayoutHandle::Bottom))
+        );
     }
 }

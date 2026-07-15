@@ -27,7 +27,6 @@ impl CollapseState {
         self.automatic
     }
 
-    #[cfg(test)]
     fn toggle_manual(&mut self) {
         self.manual = !self.manual;
     }
@@ -77,13 +76,11 @@ impl WorkbenchState {
         }
     }
 
-    #[cfg(test)]
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_collapse.toggle_manual();
         self.update_pane_visibility();
     }
 
-    #[cfg(test)]
     pub fn toggle_bottom(&mut self) {
         self.bottom_collapse.toggle_manual();
         self.update_pane_visibility();
@@ -238,6 +235,25 @@ mod tests {
                 assert_eq!(state.sidebar_collapse().is_collapsed(), manual || automatic);
             }
         }
+    }
+
+    #[test]
+    fn layout_toggle_preserves_unrelated_focus_and_selection() {
+        let mut state = WorkbenchState::default();
+        state.begin_selection(TerminalPoint::new(2, 3));
+        state.set_selection_head(TerminalPoint::new(4, 5));
+
+        state.toggle_sidebar();
+        state.toggle_bottom();
+
+        assert_eq!(state.focused_pane(), PaneId::Editor);
+        assert_eq!(
+            state.selection_range(PaneId::Editor),
+            Some(TerminalRange::inclusive(
+                TerminalPoint::new(2, 3),
+                TerminalPoint::new(4, 5)
+            ))
+        );
     }
 
     #[test]
