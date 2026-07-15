@@ -25,7 +25,7 @@ pub fn render_sidebar(
 ) {
     let text = "dummy sidebar";
     let block = Block::default()
-        .title("sidebar")
+        .title("  sidebar")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused {
             style.focused_border

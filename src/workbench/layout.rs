@@ -7,6 +7,9 @@ pub const MIN_TERMINAL_HEIGHT: u16 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkbenchLayoutConfig {
     pub sidebar_width: u16,
+    /// Explicit Nvim pane width after a manual divider drag. `None` keeps the
+    /// default responsive 55/45 split.
+    pub editor_width: Option<u16>,
     pub bottom_height: u16,
 }
 
@@ -14,6 +17,7 @@ impl Default for WorkbenchLayoutConfig {
     fn default() -> Self {
         Self {
             sidebar_width: 24,
+            editor_width: None,
             bottom_height: 12,
         }
     }
@@ -82,9 +86,10 @@ impl WorkbenchLayout {
             };
         }
 
-        // Round to the nearest cell and give any remainder to the agent.
-        let editor_width = ((u32::from(main_width) * 55 + 50) / 100) as u16;
-        let editor_width = editor_width.clamp(
+        // Round the default split to the nearest cell and give any remainder
+        // to the agent. A manually dragged divider stores an exact cell width.
+        let default_editor_width = ((u32::from(main_width) * 55 + 50) / 100) as u16;
+        let editor_width = config.editor_width.unwrap_or(default_editor_width).clamp(
             MIN_TERMINAL_WIDTH,
             main_width.saturating_sub(MIN_TERMINAL_WIDTH),
         );
@@ -184,6 +189,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn editor_agent_width_is_cell_exact_after_manual_drag() {
+        let config = WorkbenchLayoutConfig {
+            editor_width: Some(77),
+            ..WorkbenchLayoutConfig::default()
+        };
+        let layout = WorkbenchLayout::calculate(Rect::new(0, 0, 160, 40), config);
+        assert_eq!((layout.editor.width, layout.agent.width), (77, 59));
     }
 
     #[test]

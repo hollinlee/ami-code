@@ -4,7 +4,7 @@ mod pane;
 mod selection;
 mod state;
 
-pub use hit_test::{MouseTarget, hit_test};
+pub use hit_test::{LayoutDivider, LayoutHandle, MouseTarget, hit_test, layout_handle_position};
 pub use layout::{
     MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, WorkbenchLayout, WorkbenchLayoutConfig,
     WorkbenchVisibility,

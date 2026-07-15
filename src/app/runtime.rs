@@ -20,12 +20,12 @@ use super::supervisor::{RestartDecision, RestartPolicy, SessionIdentity, Session
 use crate::backend::{BackendKind, BackendSpec, NvimBackend, PiBackend, ShellBackend};
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
-    SidebarStyle, TerminalPaneStyle, render_compact_workbench, render_sidebar,
-    render_terminal_pane, render_unavailable_terminal_pane, terminal_content_size,
+    SidebarStyle, TerminalPaneStyle, render_compact_workbench, render_layout_controls,
+    render_sidebar, render_terminal_pane, render_unavailable_terminal_pane, terminal_content_size,
 };
 use crate::workbench::{
-    MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, MouseTarget, PaneId, WorkbenchLayout,
-    WorkbenchLayoutConfig, WorkbenchState, hit_test,
+    LayoutDivider, LayoutHandle, MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, MouseTarget, PaneId,
+    WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState, hit_test,
 };
 use crate::workspace::Workspace;
 
@@ -65,6 +65,21 @@ struct PendingMouseGesture {
     current: MouseEvent,
     dragging: bool,
     next_edge_scroll: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingLayoutGesture {
+    Handle {
+        handle: LayoutHandle,
+        origin: MouseEvent,
+        moved: bool,
+    },
+    Drag {
+        divider: LayoutDivider,
+        origin: MouseEvent,
+        layout: WorkbenchLayout,
+        config: WorkbenchLayoutConfig,
+    },
 }
 
 enum PasteDelivery {
@@ -465,7 +480,9 @@ struct AppRuntime {
     layout: Option<WorkbenchLayout>,
     sessions: SessionRegistry,
     status: Option<String>,
+    viewport_area: Rect,
     pending_mouse: Option<PendingMouseGesture>,
+    pending_layout: Option<PendingLayoutGesture>,
 }
 
 impl AppRuntime {
@@ -489,7 +506,9 @@ impl AppRuntime {
             layout,
             sessions,
             status: None,
+            viewport_area: area,
             pending_mouse: None,
+            pending_layout: None,
         })
     }
 
@@ -499,11 +518,23 @@ impl AppRuntime {
 
     fn shutdown(&mut self) {
         self.pending_mouse = None;
+        self.pending_layout = None;
         self.sessions.shutdown();
     }
 
     fn resize(&mut self, area: Rect) -> Result<()> {
+        self.resize_internal(area, true)
+    }
+
+    fn resize_preserving_selection(&mut self, area: Rect) -> Result<()> {
+        self.resize_internal(area, false)
+    }
+
+    fn resize_internal(&mut self, area: Rect, clear_selection: bool) -> Result<()> {
         let now = Instant::now();
+        if cancel_layout_gesture_on_resize(&mut self.pending_layout, self.viewport_area, area) {
+            self.viewport_area = area;
+        }
         if self.launch_mode.is_workbench() {
             self.workbench
                 .update_auto_collapse(area, self.layout_config);
@@ -514,7 +545,9 @@ impl AppRuntime {
             );
             if self.layout != Some(layout) {
                 self.pending_mouse = None;
-                self.clear_selection();
+                if clear_selection {
+                    self.clear_selection();
+                }
             }
             for (pane, pane_area) in [
                 (PaneId::Editor, layout.editor),
@@ -575,6 +608,7 @@ impl AppRuntime {
                 );
             }
         }
+        render_layout_controls(frame, layout);
     }
 
     fn render_slot(
@@ -585,6 +619,9 @@ impl AppRuntime {
         focused: bool,
         selection: Option<crate::terminal::TerminalRange>,
     ) {
+        let title_handle = self.launch_mode.is_workbench()
+            && pane == PaneId::Bottom
+            && self.layout.is_some_and(|layout| layout.bottom.height > 0);
         if let Some(session) = self.sessions.get(&pane) {
             render_session(
                 frame,
@@ -593,6 +630,7 @@ impl AppRuntime {
                 focused,
                 selection,
                 self.status.as_deref(),
+                title_handle,
             );
             return;
         }
@@ -606,7 +644,8 @@ impl AppRuntime {
             .get(&pane)
             .map(|slot| slot.spec.display_name.as_str())
             .unwrap_or("backend");
-        let title = session_title(display_name, Some(&status), area.width);
+        let title =
+            session_title_with_handle(display_name, Some(&status), area.width, title_handle);
         render_unavailable_terminal_pane(
             frame,
             area,
@@ -621,6 +660,7 @@ impl AppRuntime {
         match event {
             Event::Key(key) => {
                 self.pending_mouse = None;
+                self.pending_layout = None;
                 if is_quit(key) {
                     self.shutdown();
                     return Ok(false);
@@ -648,6 +688,7 @@ impl AppRuntime {
             }
             Event::Paste(contents) => {
                 self.pending_mouse = None;
+                self.pending_layout = None;
                 self.clear_selection();
                 self.paste_into_focused(&contents)?;
             }
@@ -695,17 +736,49 @@ impl AppRuntime {
                 let Some(target) = target else {
                     return Ok(());
                 };
-                self.clear_selection();
-                self.workbench.focus_pane(target.pane());
-                self.pending_mouse = Some(PendingMouseGesture {
-                    target,
-                    down: event,
-                    current: event,
-                    dragging: false,
-                    next_edge_scroll: Instant::now() + EDGE_SCROLL_INTERVAL,
-                });
+                match target {
+                    MouseTarget::Handle(handle) => {
+                        self.pending_mouse = None;
+                        self.pending_layout = Some(PendingLayoutGesture::Handle {
+                            handle,
+                            origin: event,
+                            moved: false,
+                        });
+                    }
+                    MouseTarget::Divider(divider) => {
+                        self.pending_mouse = None;
+                        self.pending_layout = Some(PendingLayoutGesture::Drag {
+                            divider,
+                            origin: event,
+                            layout,
+                            config: self.layout_config,
+                        });
+                    }
+                    _ => {
+                        self.pending_layout = None;
+                        self.clear_selection();
+                        if let Some(pane) = target.pane() {
+                            self.workbench.focus_pane(pane);
+                        }
+                        self.pending_mouse = Some(PendingMouseGesture {
+                            target,
+                            down: event,
+                            current: event,
+                            dragging: false,
+                            next_edge_scroll: Instant::now() + EDGE_SCROLL_INTERVAL,
+                        });
+                    }
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(gesture) = &mut self.pending_layout {
+                    if let PendingLayoutGesture::Handle { origin, moved, .. } = gesture {
+                        *moved |= event.column != origin.column || event.row != origin.row;
+                    } else {
+                        self.update_layout_drag(event)?;
+                    }
+                    return Ok(());
+                }
                 let Some(mut pending) = self.pending_mouse else {
                     return Ok(());
                 };
@@ -719,6 +792,16 @@ impl AppRuntime {
                 self.pending_mouse = Some(pending);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(gesture) = self.pending_layout.take() {
+                    if let Some(handle) = activated_layout_handle(gesture, target) {
+                        match handle {
+                            LayoutHandle::Sidebar => self.workbench.toggle_sidebar(),
+                            LayoutHandle::Bottom => self.workbench.toggle_bottom(),
+                        }
+                        self.resize_preserving_selection(self.viewport_area)?;
+                    }
+                    return Ok(());
+                }
                 let Some(mut pending) = self.pending_mouse.take() else {
                     return Ok(());
                 };
@@ -738,6 +821,20 @@ impl AppRuntime {
         }
 
         Ok(())
+    }
+
+    fn update_layout_drag(&mut self, event: MouseEvent) -> Result<()> {
+        let Some(PendingLayoutGesture::Drag {
+            divider,
+            origin,
+            layout,
+            config,
+        }) = self.pending_layout
+        else {
+            return Ok(());
+        };
+        self.layout_config = layout_drag_config(divider, origin, event, layout, config);
+        self.resize_preserving_selection(self.viewport_area)
     }
 
     fn begin_mouse_selection(&mut self, target: MouseTarget) -> bool {
@@ -934,8 +1031,9 @@ fn render_session(
     focused: bool,
     selection: Option<crate::terminal::TerminalRange>,
     status: Option<&str>,
+    title_handle: bool,
 ) {
-    let title = session_title(session.display_name(), status, area.width);
+    let title = session_title_with_handle(session.display_name(), status, area.width, title_handle);
     render_terminal_pane(
         frame,
         area,
@@ -945,6 +1043,76 @@ fn render_session(
         selection,
         TerminalPaneStyle::default(),
     );
+}
+
+fn activated_layout_handle(
+    gesture: PendingLayoutGesture,
+    release_target: Option<MouseTarget>,
+) -> Option<LayoutHandle> {
+    let PendingLayoutGesture::Handle { handle, moved, .. } = gesture else {
+        return None;
+    };
+    (!moved && release_target == Some(MouseTarget::Handle(handle))).then_some(handle)
+}
+
+fn cancel_layout_gesture_on_resize(
+    pending: &mut Option<PendingLayoutGesture>,
+    previous: Rect,
+    next: Rect,
+) -> bool {
+    if previous == next {
+        return false;
+    }
+    // A resize invalidates a drag's geometry snapshot.
+    *pending = None;
+    true
+}
+
+fn layout_drag_config(
+    divider: LayoutDivider,
+    origin: MouseEvent,
+    current: MouseEvent,
+    layout: WorkbenchLayout,
+    config: WorkbenchLayoutConfig,
+) -> WorkbenchLayoutConfig {
+    let dx = i32::from(current.column) - i32::from(origin.column);
+    let dy = i32::from(current.row) - i32::from(origin.row);
+    let mut next = config;
+    match divider {
+        LayoutDivider::SidebarMain => {
+            let total = layout
+                .sidebar
+                .width
+                .saturating_add(layout.editor.width)
+                .saturating_add(layout.agent.width);
+            let max = total.saturating_sub(MIN_TERMINAL_WIDTH.saturating_mul(2));
+            next.sidebar_width = offset_clamped(config.sidebar_width, dx, MIN_TERMINAL_WIDTH, max);
+        }
+        LayoutDivider::EditorAgent => {
+            let main = layout.editor.width.saturating_add(layout.agent.width);
+            let width = offset_clamped(
+                layout.editor.width,
+                dx,
+                MIN_TERMINAL_WIDTH,
+                main.saturating_sub(MIN_TERMINAL_WIDTH),
+            );
+            next.editor_width = Some(width);
+        }
+        LayoutDivider::EditorBottom => {
+            let max = layout
+                .editor
+                .height
+                .saturating_add(layout.bottom.height)
+                .saturating_sub(MIN_TERMINAL_HEIGHT);
+            next.bottom_height =
+                offset_clamped(config.bottom_height, -dy, MIN_TERMINAL_HEIGHT, max);
+        }
+    }
+    next
+}
+
+fn offset_clamped(start: u16, delta: i32, min: u16, max: u16) -> u16 {
+    (i32::from(start) + delta).clamp(i32::from(min), i32::from(max.max(min))) as u16
 }
 
 fn mouse_at(mut event: MouseEvent, row: u16, col: u16) -> MouseEvent {
@@ -992,6 +1160,25 @@ fn edge_scroll_direction(layout: WorkbenchLayout, pane: PaneId, event: MouseEven
         -1
     } else {
         0
+    }
+}
+
+fn session_title_with_handle(
+    display_name: &str,
+    status: Option<&str>,
+    pane_width: u16,
+    title_handle: bool,
+) -> String {
+    let title_width = if title_handle {
+        pane_width.saturating_sub(2)
+    } else {
+        pane_width
+    };
+    let title = session_title(display_name, status, title_width);
+    if title_handle {
+        format!("  {title}")
+    } else {
+        title
     }
 }
 
@@ -1183,6 +1370,10 @@ mod tests {
             "pi — clipboard un…"
         );
         assert_eq!(session_title("nvim", None, 20), "nvim");
+        assert_eq!(
+            session_title_with_handle("shell", None, 20, true),
+            "  shell"
+        );
         assert!(!session_title("shell", None, 20).contains("Ctrl+Q"));
     }
 
@@ -1204,6 +1395,113 @@ mod tests {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             false,
         ));
+    }
+
+    fn mouse(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn layout_drags_use_snapshot_delta_capture_and_clamp_all_terminals() {
+        let config = WorkbenchLayoutConfig::default();
+        let layout = WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), config);
+
+        // A move is calculated from the down snapshot, not a prior move.
+        let sidebar = layout_drag_config(
+            LayoutDivider::SidebarMain,
+            mouse(layout.editor.x, 2),
+            mouse(layout.editor.x + 10, 2),
+            layout,
+            config,
+        );
+        assert_eq!(sidebar.sidebar_width, config.sidebar_width + 10);
+
+        // The editor/agent divider follows the captured pointer cell exactly.
+        let split = layout_drag_config(
+            LayoutDivider::EditorAgent,
+            mouse(layout.agent.x, 2),
+            mouse(layout.agent.x + 7, 2),
+            layout,
+            config,
+        );
+        assert_eq!(split.editor_width, Some(layout.editor.width + 7));
+        let split_layout = WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), split);
+        assert_eq!(split_layout.editor.width, layout.editor.width + 7);
+
+        // Coordinates far outside the pane remain captured and clamp both sides
+        // to a bordered-terminal minimum.
+        let clamped_split = layout_drag_config(
+            LayoutDivider::EditorAgent,
+            mouse(layout.agent.x, 2),
+            mouse(u16::MAX, 2),
+            layout,
+            config,
+        );
+        let clamped_layout = WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), clamped_split);
+        assert!(clamped_layout.editor.width >= MIN_TERMINAL_WIDTH);
+        assert!(clamped_layout.agent.width >= MIN_TERMINAL_WIDTH);
+
+        let bottom = layout_drag_config(
+            LayoutDivider::EditorBottom,
+            mouse(30, layout.bottom.y),
+            mouse(30, 0),
+            layout,
+            config,
+        );
+        let bottom_layout = WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), bottom);
+        assert!(bottom_layout.editor.height >= MIN_TERMINAL_HEIGHT);
+        assert!(bottom_layout.bottom.height >= MIN_TERMINAL_HEIGHT);
+    }
+
+    #[test]
+    fn handle_release_requires_an_unmoved_pointer_on_the_same_handle() {
+        let origin = mouse(24, 0);
+        let handle = PendingLayoutGesture::Handle {
+            handle: LayoutHandle::Sidebar,
+            origin,
+            moved: false,
+        };
+        assert_eq!(
+            activated_layout_handle(handle, Some(MouseTarget::Handle(LayoutHandle::Sidebar))),
+            Some(LayoutHandle::Sidebar)
+        );
+
+        let moved = PendingLayoutGesture::Handle {
+            handle: LayoutHandle::Sidebar,
+            origin,
+            moved: true,
+        };
+        assert_eq!(
+            activated_layout_handle(moved, Some(MouseTarget::Handle(LayoutHandle::Sidebar))),
+            None
+        );
+        assert_eq!(
+            activated_layout_handle(handle, Some(MouseTarget::Sidebar)),
+            None
+        );
+    }
+
+    #[test]
+    fn viewport_resize_cancels_captured_layout_drag() {
+        let layout =
+            WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), WorkbenchLayoutConfig::default());
+        let mut pending = Some(PendingLayoutGesture::Drag {
+            divider: LayoutDivider::EditorAgent,
+            origin: mouse(layout.agent.x, 2),
+            layout,
+            config: WorkbenchLayoutConfig::default(),
+        });
+        assert!(cancel_layout_gesture_on_resize(
+            &mut pending,
+            Rect::new(0, 0, 120, 40),
+            Rect::new(0, 0, 121, 40),
+        ));
+        assert!(pending.is_none());
     }
 
     #[test]
