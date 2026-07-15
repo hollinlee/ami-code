@@ -74,8 +74,9 @@ mod tests {
                 col: 0,
             })
         );
+        let agent = layout().agent;
         assert_eq!(
-            hit_test(layout(), 81, 1),
+            hit_test(layout(), agent.x + 1, agent.y + 1),
             Some(MouseTarget::Content {
                 pane: PaneId::Agent,
                 row: 0,
@@ -91,8 +92,9 @@ mod tests {
             hit_test(layout(), 24, 0),
             Some(MouseTarget::Border(PaneId::Editor))
         );
+        let bottom = layout().bottom;
         assert_eq!(
-            hit_test(layout(), 79, 39),
+            hit_test(layout(), bottom.right() - 1, bottom.bottom() - 1),
             Some(MouseTarget::Border(PaneId::Bottom))
         );
     }

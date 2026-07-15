@@ -5,7 +5,10 @@ mod selection;
 mod state;
 
 pub use hit_test::{MouseTarget, hit_test};
-pub use layout::{WorkbenchLayout, WorkbenchLayoutConfig};
+pub use layout::{
+    MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, WorkbenchLayout, WorkbenchLayoutConfig,
+    WorkbenchVisibility,
+};
 pub use pane::{PaneId, PaneKind, PaneState};
 pub use selection::PaneSelection;
 pub use state::WorkbenchState;

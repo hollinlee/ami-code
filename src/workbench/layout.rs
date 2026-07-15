@@ -1,9 +1,12 @@
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
+
+/// A bordered terminal needs one content cell in each direction.
+pub const MIN_TERMINAL_WIDTH: u16 = 4;
+pub const MIN_TERMINAL_HEIGHT: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkbenchLayoutConfig {
     pub sidebar_width: u16,
-    pub agent_width: u16,
     pub bottom_height: u16,
 }
 
@@ -11,8 +14,33 @@ impl Default for WorkbenchLayoutConfig {
     fn default() -> Self {
         Self {
             sidebar_width: 24,
-            agent_width: 40,
             bottom_height: 12,
+        }
+    }
+}
+
+impl WorkbenchLayoutConfig {
+    pub fn sidebar_shortage_width(self) -> u16 {
+        self.sidebar_width
+            .saturating_add(MIN_TERMINAL_WIDTH.saturating_mul(2))
+    }
+
+    pub fn bottom_shortage_height(self) -> u16 {
+        self.bottom_height.saturating_add(MIN_TERMINAL_HEIGHT)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkbenchVisibility {
+    pub sidebar: bool,
+    pub bottom: bool,
+}
+
+impl Default for WorkbenchVisibility {
+    fn default() -> Self {
+        Self {
+            sidebar: true,
+            bottom: true,
         }
     }
 }
@@ -23,29 +51,79 @@ pub struct WorkbenchLayout {
     pub editor: Rect,
     pub agent: Rect,
     pub bottom: Rect,
+    /// True when even two bordered terminals cannot be represented safely.
+    pub compact: bool,
 }
 
 impl WorkbenchLayout {
+    #[cfg(test)]
     pub fn calculate(area: Rect, config: WorkbenchLayoutConfig) -> Self {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(config.sidebar_width),
-                Constraint::Min(1),
-                Constraint::Length(config.agent_width),
-            ])
-            .split(area);
+        Self::calculate_visible(area, config, WorkbenchVisibility::default())
+    }
 
-        let middle = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(config.bottom_height)])
-            .split(columns[1]);
+    pub fn calculate_visible(
+        area: Rect,
+        config: WorkbenchLayoutConfig,
+        visibility: WorkbenchVisibility,
+    ) -> Self {
+        let sidebar_width = if visibility.sidebar {
+            config.sidebar_width.min(area.width)
+        } else {
+            0
+        };
+        let main_width = area.width.saturating_sub(sidebar_width);
+        if main_width < MIN_TERMINAL_WIDTH.saturating_mul(2) || area.height < MIN_TERMINAL_HEIGHT {
+            return Self {
+                sidebar: Rect::default(),
+                editor: Rect::default(),
+                agent: Rect::default(),
+                bottom: Rect::default(),
+                compact: true,
+            };
+        }
+
+        // Round to the nearest cell and give any remainder to the agent.
+        let editor_width = ((u32::from(main_width) * 55 + 50) / 100) as u16;
+        let editor_width = editor_width.clamp(
+            MIN_TERMINAL_WIDTH,
+            main_width.saturating_sub(MIN_TERMINAL_WIDTH),
+        );
+        let agent_width = main_width - editor_width;
+        let main_x = area.x.saturating_add(sidebar_width);
+
+        let bottom_height = if visibility.bottom {
+            config
+                .bottom_height
+                .min(area.height.saturating_sub(MIN_TERMINAL_HEIGHT))
+        } else {
+            0
+        };
+        let editor_height = area.height - bottom_height;
 
         Self {
-            sidebar: columns[0],
-            editor: middle[0],
-            bottom: middle[1],
-            agent: columns[2],
+            sidebar: if visibility.sidebar {
+                Rect::new(area.x, area.y, sidebar_width, area.height)
+            } else {
+                Rect::default()
+            },
+            editor: Rect::new(main_x, area.y, editor_width, editor_height),
+            agent: Rect::new(
+                main_x.saturating_add(editor_width),
+                area.y,
+                agent_width,
+                area.height,
+            ),
+            bottom: if visibility.bottom && bottom_height >= MIN_TERMINAL_HEIGHT {
+                Rect::new(
+                    main_x,
+                    area.y.saturating_add(editor_height),
+                    editor_width,
+                    bottom_height,
+                )
+            } else {
+                Rect::default()
+            },
+            compact: false,
         }
     }
 }
@@ -55,28 +133,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_default_workbench_dimensions() {
+    fn uses_55_45_post_sidebar_geometry() {
         let area = Rect::new(0, 0, 160, 50);
         let layout = WorkbenchLayout::calculate(area, WorkbenchLayoutConfig::default());
 
         assert_eq!(layout.sidebar.width, 24);
-        assert_eq!(layout.agent.width, 40);
+        assert_eq!((layout.editor.width, layout.agent.width), (75, 61));
         assert_eq!(layout.bottom.height, 12);
-        assert_eq!(layout.editor.x, 24);
-        assert_eq!(layout.agent.x, 120);
+        assert_eq!(layout.agent.height, 50);
         assert_eq!(layout.bottom.y, 38);
+        assert_eq!(layout.bottom.x, layout.editor.x);
+        assert_eq!(layout.bottom.width, layout.editor.width);
     }
 
     #[test]
-    fn keeps_narrow_layout_inside_available_area() {
-        let area = Rect::new(0, 0, 40, 10);
-        let layout = WorkbenchLayout::calculate(area, WorkbenchLayoutConfig::default());
-
-        for pane in [layout.sidebar, layout.editor, layout.agent, layout.bottom] {
-            assert!(pane.x.saturating_add(pane.width) <= area.right());
-            assert!(pane.y.saturating_add(pane.height) <= area.bottom());
+    fn exhaustive_small_viewports_are_contained_and_visible_terminals_are_nonzero() {
+        let config = WorkbenchLayoutConfig::default();
+        for width in 0..=80 {
+            for height in 0..=24 {
+                let area = Rect::new(7, 9, width, height);
+                for visibility in [
+                    WorkbenchVisibility {
+                        sidebar: false,
+                        bottom: false,
+                    },
+                    WorkbenchVisibility {
+                        sidebar: true,
+                        bottom: false,
+                    },
+                    WorkbenchVisibility {
+                        sidebar: false,
+                        bottom: true,
+                    },
+                    WorkbenchVisibility {
+                        sidebar: true,
+                        bottom: true,
+                    },
+                ] {
+                    let layout = WorkbenchLayout::calculate_visible(area, config, visibility);
+                    for pane in [layout.sidebar, layout.editor, layout.agent, layout.bottom] {
+                        assert!(pane.right() <= area.right());
+                        assert!(pane.bottom() <= area.bottom());
+                    }
+                    for pane in [layout.editor, layout.agent, layout.bottom] {
+                        if pane.width != 0 || pane.height != 0 {
+                            assert!(pane.width >= MIN_TERMINAL_WIDTH);
+                            assert!(pane.height >= MIN_TERMINAL_HEIGHT);
+                        }
+                    }
+                }
+            }
         }
-        assert!(layout.editor.width >= 1);
-        assert!(layout.editor.height >= 1);
+    }
+
+    #[test]
+    fn eighty_by_twenty_four_is_safe() {
+        let config = WorkbenchLayoutConfig::default();
+        let layout = WorkbenchLayout::calculate(Rect::new(0, 0, 80, 24), config);
+        assert!(!layout.compact);
+        assert_eq!((layout.editor.width, layout.agent.width), (31, 25));
+        assert_eq!((layout.editor.height, layout.bottom.height), (12, 12));
     }
 }
