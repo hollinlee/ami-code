@@ -1,6 +1,7 @@
 mod hit_test;
 mod layout;
 mod pane;
+mod persistence;
 mod selection;
 mod state;
 
@@ -10,5 +11,6 @@ pub use layout::{
     WorkbenchVisibility,
 };
 pub use pane::{PaneId, PaneKind, PaneState};
+pub use persistence::{LayoutIntent, LayoutStore};
 pub use selection::PaneSelection;
 pub use state::WorkbenchState;

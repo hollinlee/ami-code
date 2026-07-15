@@ -24,8 +24,8 @@ use crate::ui::{
     render_sidebar, render_terminal_pane, render_unavailable_terminal_pane, terminal_content_size,
 };
 use crate::workbench::{
-    LayoutDivider, LayoutHandle, MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, MouseTarget, PaneId,
-    WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState, hit_test,
+    LayoutDivider, LayoutHandle, LayoutStore, MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, MouseTarget,
+    PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState, hit_test,
 };
 use crate::workspace::Workspace;
 
@@ -483,12 +483,42 @@ struct AppRuntime {
     viewport_area: Rect,
     pending_mouse: Option<PendingMouseGesture>,
     pending_layout: Option<PendingLayoutGesture>,
+    layout_store: Option<LayoutStore>,
 }
 
 impl AppRuntime {
     fn new(launch_mode: LaunchMode, workspace: Workspace, area: Rect) -> Result<Self> {
         let mut workbench = WorkbenchState::default();
-        let layout_config = WorkbenchLayoutConfig::default();
+        let mut layout_config = WorkbenchLayoutConfig::default();
+        let mut status = None;
+        let layout_store = if launch_mode.is_workbench() {
+            match LayoutStore::from_environment(workspace.root()) {
+                Ok(store) => {
+                    match store.load() {
+                        Ok(Some(intent)) => {
+                            layout_config = intent.config;
+                            workbench.set_manual_collapse(
+                                intent.sidebar_collapsed,
+                                intent.bottom_collapsed,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            status = Some(format!("saved layout ignored: {error:#}"));
+                        }
+                    }
+                    Some(store)
+                }
+                Err(error) => {
+                    status = Some(format!("layout persistence unavailable: {error:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Loaded user intent is installed before this first automatic solve and
+        // before SessionRegistry receives initial PTY dimensions.
         let layout = launch_mode.is_workbench().then(|| {
             workbench.update_auto_collapse(area, layout_config);
             WorkbenchLayout::calculate_visible(area, layout_config, workbench.visibility())
@@ -505,10 +535,11 @@ impl AppRuntime {
             layout_config,
             layout,
             sessions,
-            status: None,
+            status,
             viewport_area: area,
             pending_mouse: None,
             pending_layout: None,
+            layout_store,
         })
     }
 
@@ -518,7 +549,7 @@ impl AppRuntime {
 
     fn shutdown(&mut self) {
         self.pending_mouse = None;
-        self.pending_layout = None;
+        self.cancel_layout_gesture();
         self.sessions.shutdown();
     }
 
@@ -532,7 +563,8 @@ impl AppRuntime {
 
     fn resize_internal(&mut self, area: Rect, clear_selection: bool) -> Result<()> {
         let now = Instant::now();
-        if cancel_layout_gesture_on_resize(&mut self.pending_layout, self.viewport_area, area) {
+        if self.viewport_area != area {
+            self.cancel_layout_gesture();
             self.viewport_area = area;
         }
         if self.launch_mode.is_workbench() {
@@ -566,6 +598,12 @@ impl AppRuntime {
                 .resize_slot(PaneId::Editor, terminal_content_size(area), now)?;
         }
         Ok(())
+    }
+
+    fn cancel_layout_gesture(&mut self) {
+        if let Some(config) = canceled_layout_config(&mut self.pending_layout) {
+            self.layout_config = config;
+        }
     }
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
@@ -660,7 +698,7 @@ impl AppRuntime {
         match event {
             Event::Key(key) => {
                 self.pending_mouse = None;
-                self.pending_layout = None;
+                self.cancel_layout_gesture();
                 if is_quit(key) {
                     self.shutdown();
                     return Ok(false);
@@ -688,7 +726,7 @@ impl AppRuntime {
             }
             Event::Paste(contents) => {
                 self.pending_mouse = None;
-                self.pending_layout = None;
+                self.cancel_layout_gesture();
                 self.clear_selection();
                 self.paste_into_focused(&contents)?;
             }
@@ -733,6 +771,7 @@ impl AppRuntime {
 
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.cancel_layout_gesture();
                 let Some(target) = target else {
                     return Ok(());
                 };
@@ -793,12 +832,22 @@ impl AppRuntime {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(gesture) = self.pending_layout.take() {
-                    if let Some(handle) = activated_layout_handle(gesture, target) {
-                        match handle {
-                            LayoutHandle::Sidebar => self.workbench.toggle_sidebar(),
-                            LayoutHandle::Bottom => self.workbench.toggle_bottom(),
+                    match gesture {
+                        PendingLayoutGesture::Handle { .. } => {
+                            if let Some(handle) = activated_layout_handle(gesture, target) {
+                                match handle {
+                                    LayoutHandle::Sidebar => self.workbench.toggle_sidebar(),
+                                    LayoutHandle::Bottom => self.workbench.toggle_bottom(),
+                                }
+                                self.resize_preserving_selection(self.viewport_area)?;
+                                self.save_layout_intent();
+                            }
                         }
-                        self.resize_preserving_selection(self.viewport_area)?;
+                        PendingLayoutGesture::Drag { .. } => {
+                            // Drag motion updates the preview only. Mouse-up is
+                            // the sole divider commit point.
+                            self.save_layout_intent();
+                        }
                     }
                     return Ok(());
                 }
@@ -999,6 +1048,25 @@ impl AppRuntime {
         Ok(())
     }
 
+    fn save_layout_intent(&mut self) {
+        let Some(store) = &self.layout_store else {
+            return;
+        };
+        let intent = self.workbench.layout_intent(self.layout_config);
+        match store.save(intent) {
+            Ok(())
+                if self.status.as_deref().is_some_and(|status| {
+                    status.starts_with("failed to save layout:")
+                        || status.starts_with("saved layout ignored:")
+                }) =>
+            {
+                self.status = None;
+            }
+            Ok(()) => {}
+            Err(error) => self.set_status(format!("failed to save layout: {error:#}")),
+        }
+    }
+
     fn set_status(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
     }
@@ -1055,17 +1123,13 @@ fn activated_layout_handle(
     (!moved && release_target == Some(MouseTarget::Handle(handle))).then_some(handle)
 }
 
-fn cancel_layout_gesture_on_resize(
+fn canceled_layout_config(
     pending: &mut Option<PendingLayoutGesture>,
-    previous: Rect,
-    next: Rect,
-) -> bool {
-    if previous == next {
-        return false;
+) -> Option<WorkbenchLayoutConfig> {
+    match pending.take() {
+        Some(PendingLayoutGesture::Drag { config, .. }) => Some(config),
+        Some(PendingLayoutGesture::Handle { .. }) | None => None,
     }
-    // A resize invalidates a drag's geometry snapshot.
-    *pending = None;
-    true
 }
 
 fn layout_drag_config(
@@ -1487,21 +1551,26 @@ mod tests {
     }
 
     #[test]
-    fn viewport_resize_cancels_captured_layout_drag() {
-        let layout =
-            WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), WorkbenchLayoutConfig::default());
+    fn canceled_drag_returns_its_snapshot_for_rollback() {
+        let snapshot = WorkbenchLayoutConfig::default();
+        let layout = WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), snapshot);
         let mut pending = Some(PendingLayoutGesture::Drag {
             divider: LayoutDivider::EditorAgent,
             origin: mouse(layout.agent.x, 2),
             layout,
-            config: WorkbenchLayoutConfig::default(),
+            config: snapshot,
         });
-        assert!(cancel_layout_gesture_on_resize(
-            &mut pending,
-            Rect::new(0, 0, 120, 40),
-            Rect::new(0, 0, 121, 40),
-        ));
+
+        assert_eq!(canceled_layout_config(&mut pending), Some(snapshot));
         assert!(pending.is_none());
+
+        let mut handle = Some(PendingLayoutGesture::Handle {
+            handle: LayoutHandle::Sidebar,
+            origin: mouse(1, 0),
+            moved: false,
+        });
+        assert_eq!(canceled_layout_config(&mut handle), None);
+        assert!(handle.is_none());
     }
 
     #[test]

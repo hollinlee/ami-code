@@ -1,7 +1,8 @@
 use ratatui::layout::Rect;
 
 use super::{
-    PaneId, PaneKind, PaneSelection, PaneState, WorkbenchLayoutConfig, WorkbenchVisibility,
+    LayoutIntent, PaneId, PaneKind, PaneSelection, PaneState, WorkbenchLayoutConfig,
+    WorkbenchVisibility,
 };
 use crate::backend::BackendKind;
 use crate::terminal::{TerminalPoint, TerminalRange};
@@ -84,6 +85,25 @@ impl WorkbenchState {
     pub fn toggle_bottom(&mut self) {
         self.bottom_collapse.toggle_manual();
         self.update_pane_visibility();
+    }
+
+    pub fn set_manual_collapse(&mut self, sidebar: bool, bottom: bool) {
+        self.sidebar_collapse.manual = sidebar;
+        self.bottom_collapse.manual = bottom;
+        self.update_pane_visibility();
+    }
+
+    pub fn manual_collapse(&self) -> (bool, bool) {
+        (self.sidebar_collapse.manual, self.bottom_collapse.manual)
+    }
+
+    pub fn layout_intent(&self, config: WorkbenchLayoutConfig) -> LayoutIntent {
+        let (sidebar_collapsed, bottom_collapsed) = self.manual_collapse();
+        LayoutIntent {
+            config,
+            sidebar_collapsed,
+            bottom_collapsed,
+        }
     }
 
     #[cfg(test)]
@@ -210,6 +230,16 @@ mod tests {
         );
         assert!(!state.sidebar_collapse().is_collapsed());
         assert!(!state.bottom_collapse().is_collapsed());
+    }
+
+    #[test]
+    fn automatic_collapse_never_changes_serialized_manual_intent() {
+        let mut state = WorkbenchState::default();
+        state.toggle_sidebar();
+        let config = WorkbenchLayoutConfig::default();
+        let before = state.layout_intent(config);
+        state.update_auto_collapse(Rect::new(0, 0, 1, 1), config);
+        assert_eq!(state.layout_intent(config), before);
     }
 
     #[test]
