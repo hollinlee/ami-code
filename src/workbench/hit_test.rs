@@ -21,7 +21,7 @@ pub enum LayoutHandle {
 pub enum MouseTarget {
     Handle(LayoutHandle),
     Divider(LayoutDivider),
-    Sidebar,
+    Sidebar { row: u16, col: u16 },
     Border(PaneId),
     ShellTabStrip,
     Content { pane: PaneId, row: u16, col: u16 },
@@ -30,7 +30,7 @@ pub enum MouseTarget {
 impl MouseTarget {
     pub fn pane(self) -> Option<PaneId> {
         match self {
-            Self::Sidebar => Some(PaneId::Sidebar),
+            Self::Sidebar { .. } => Some(PaneId::Sidebar),
             Self::Border(pane) | Self::Content { pane, .. } => Some(pane),
             Self::Handle(_) | Self::Divider(_) | Self::ShellTabStrip => None,
         }
@@ -85,7 +85,13 @@ pub fn hit_test(layout: WorkbenchLayout, column: u16, row: u16) -> Option<MouseT
     }
 
     if contains(layout.sidebar, column, row) {
-        return Some(MouseTarget::Sidebar);
+        if is_border(layout.sidebar, column, row) {
+            return Some(MouseTarget::Border(PaneId::Sidebar));
+        }
+        return Some(MouseTarget::Sidebar {
+            row: row - layout.sidebar.y - 1,
+            col: column - layout.sidebar.x - 1,
+        });
     }
 
     for (pane, area) in [
@@ -130,6 +136,19 @@ mod tests {
 
     fn layout() -> WorkbenchLayout {
         WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), WorkbenchLayoutConfig::default())
+    }
+
+    #[test]
+    fn maps_sidebar_content_to_local_coordinates_and_keeps_border_as_chrome() {
+        let layout = layout();
+        assert_eq!(
+            hit_test(layout, layout.sidebar.x + 3, layout.sidebar.y + 2),
+            Some(MouseTarget::Sidebar { row: 1, col: 2 })
+        );
+        assert_eq!(
+            hit_test(layout, layout.sidebar.x, layout.sidebar.y + 2),
+            Some(MouseTarget::Border(PaneId::Sidebar))
+        );
     }
 
     #[test]

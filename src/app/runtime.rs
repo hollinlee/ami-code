@@ -33,6 +33,7 @@ use crate::workbench::{
     WorkbenchLayoutConfig, WorkbenchState, hit_test, shell_tab_hit_test,
 };
 use crate::workspace::Workspace;
+use crate::workspace::sidebar::Sidebar;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SCROLLBACK_LINES: usize = 1_000;
@@ -69,6 +70,7 @@ struct PendingMouseGesture {
     down: MouseEvent,
     current: MouseEvent,
     dragging: bool,
+    moved: bool,
     next_edge_scroll: Instant,
 }
 
@@ -681,6 +683,8 @@ struct AppRuntime {
     layout_config: WorkbenchLayoutConfig,
     layout: Option<WorkbenchLayout>,
     sessions: SessionRegistry,
+    sidebar: Option<Sidebar>,
+    sidebar_error: Option<String>,
     status: Option<String>,
     viewport_area: Rect,
     pending_mouse: Option<PendingMouseGesture>,
@@ -730,6 +734,18 @@ impl AppRuntime {
         } else {
             SessionRegistry::single(launch_mode, &workspace, area, Instant::now())?
         };
+        let (sidebar, sidebar_error) = if launch_mode.is_workbench() {
+            match Sidebar::new(workspace.root().to_path_buf()) {
+                Ok(mut sidebar) => {
+                    debug_assert_eq!(sidebar.root(), workspace.root());
+                    sidebar.request_initial();
+                    (Some(sidebar), None)
+                }
+                Err(error) => (None, Some(format!("sidebar unavailable: {error}"))),
+            }
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             launch_mode,
@@ -737,6 +753,8 @@ impl AppRuntime {
             layout_config,
             layout,
             sessions,
+            sidebar,
+            sidebar_error,
             status,
             viewport_area: area,
             pending_mouse: None,
@@ -746,6 +764,9 @@ impl AppRuntime {
     }
 
     fn poll_sessions_at(&mut self, now: Instant) -> Result<()> {
+        if let Some(sidebar) = &mut self.sidebar {
+            sidebar.tick();
+        }
         let exited = self.sessions.poll(now)?;
         for id in exited {
             self.close_shell_tab(id, now);
@@ -859,9 +880,22 @@ impl AppRuntime {
             return;
         }
         if layout.sidebar.width > 0 && layout.sidebar.height > 0 {
+            let viewport_rows = sidebar_viewport_rows(layout.sidebar);
+            let rows = self
+                .sidebar
+                .as_ref()
+                .map(|sidebar| sidebar.visible_rows(viewport_rows))
+                .unwrap_or_default();
+            let error = self
+                .sidebar
+                .as_ref()
+                .and_then(Sidebar::git_error)
+                .or(self.sidebar_error.as_deref());
             render_sidebar(
                 frame,
                 layout.sidebar,
+                &rows,
+                error,
                 self.workbench.is_focused(PaneId::Sidebar),
                 SidebarStyle::default(),
             );
@@ -1111,6 +1145,7 @@ impl AppRuntime {
                             down: event,
                             current: event,
                             dragging: false,
+                            moved: false,
                             next_edge_scroll: Instant::now() + EDGE_SCROLL_INTERVAL,
                         });
                     }
@@ -1128,6 +1163,8 @@ impl AppRuntime {
                 let Some(mut pending) = self.pending_mouse else {
                     return Ok(());
                 };
+                pending.moved |=
+                    event.column != pending.down.column || event.row != pending.down.row;
                 if !pending.dragging {
                     pending.dragging = self.begin_mouse_selection(pending.target);
                 }
@@ -1265,6 +1302,18 @@ impl AppRuntime {
         pending: PendingMouseGesture,
         release: MouseEvent,
     ) -> Result<()> {
+        if matches!(pending.target, MouseTarget::Sidebar { .. }) {
+            if let Some(row) = activated_sidebar_row(pending, release) {
+                let viewport_rows = self
+                    .layout
+                    .map(|layout| sidebar_viewport_rows(layout.sidebar))
+                    .unwrap_or(0);
+                if let Some(sidebar) = &mut self.sidebar {
+                    sidebar.click_visible_row(row, viewport_rows);
+                }
+            }
+            return Ok(());
+        }
         let MouseTarget::Content { pane, row, col } = pending.target else {
             return Ok(());
         };
@@ -1312,6 +1361,25 @@ impl AppRuntime {
     }
 
     fn route_mouse_wheel(&mut self, target: Option<MouseTarget>, event: MouseEvent) -> Result<()> {
+        if matches!(
+            target,
+            Some(MouseTarget::Sidebar { .. } | MouseTarget::Border(PaneId::Sidebar))
+        ) {
+            let delta = match event.kind {
+                MouseEventKind::ScrollUp => -isize::try_from(MOUSE_WHEEL_LINES).unwrap_or(0),
+                MouseEventKind::ScrollDown => isize::try_from(MOUSE_WHEEL_LINES).unwrap_or(0),
+                MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => 0,
+                _ => return Ok(()),
+            };
+            let viewport_rows = self
+                .layout
+                .map(|layout| sidebar_viewport_rows(layout.sidebar))
+                .unwrap_or(0);
+            if let Some(sidebar) = &mut self.sidebar {
+                sidebar.scroll(delta, viewport_rows);
+            }
+            return Ok(());
+        }
         let Some(MouseTarget::Content { pane, row, col }) = target else {
             return Ok(());
         };
@@ -1536,6 +1604,19 @@ fn session_key(workbench: &WorkbenchState, pane: PaneId) -> SessionKey {
     } else {
         SessionKey::Pane(pane)
     }
+}
+
+fn sidebar_viewport_rows(area: Rect) -> usize {
+    const BORDER_ROWS: u16 = 2;
+    usize::from(area.height.saturating_sub(BORDER_ROWS))
+}
+
+fn activated_sidebar_row(pending: PendingMouseGesture, release: MouseEvent) -> Option<usize> {
+    let MouseTarget::Sidebar { row, .. } = pending.target else {
+        return None;
+    };
+    (!pending.moved && release.column == pending.down.column && release.row == pending.down.row)
+        .then_some(usize::from(row))
 }
 
 fn pane_area(layout: WorkbenchLayout, pane: PaneId) -> Option<Rect> {
@@ -1891,6 +1972,31 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_click_requires_an_unmoved_pointer_on_the_same_cell() {
+        let down = mouse(4, 3);
+        let pending = PendingMouseGesture {
+            target: MouseTarget::Sidebar { row: 2, col: 3 },
+            down,
+            current: down,
+            dragging: false,
+            moved: false,
+            next_edge_scroll: Instant::now(),
+        };
+        assert_eq!(activated_sidebar_row(pending, down), Some(2));
+        assert_eq!(activated_sidebar_row(pending, mouse(5, 3)), None);
+        assert_eq!(
+            activated_sidebar_row(
+                PendingMouseGesture {
+                    moved: true,
+                    ..pending
+                },
+                down
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn handle_release_requires_an_unmoved_pointer_on_the_same_handle() {
         let origin = mouse(24, 0);
         let handle = PendingLayoutGesture::Handle {
@@ -1913,7 +2019,7 @@ mod tests {
             None
         );
         assert_eq!(
-            activated_layout_handle(handle, Some(MouseTarget::Sidebar)),
+            activated_layout_handle(handle, Some(MouseTarget::Sidebar { row: 0, col: 0 })),
             None
         );
     }
