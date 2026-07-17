@@ -18,8 +18,8 @@ use ratatui::layout::Rect;
 use super::LaunchMode;
 use super::supervisor::{RestartDecision, RestartPolicy, SessionIdentity, SessionIds};
 use crate::backend::{
-    BackendKind, BackendSpec, ManagedNvimGeneration, ManagedNvimProfile, NvimController, PiBackend,
-    ShellBackend,
+    BackendKind, BackendSpec, ManagedNvimGeneration, ManagedNvimProfile, ManagedPiProfile,
+    NvimController, ShellBackend,
 };
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
@@ -118,6 +118,33 @@ enum ProcessSource {
         current: Option<ManagedNvimGeneration>,
         controller: NvimController,
     },
+    ManagedPi {
+        workspace: Workspace,
+        materialization: ManagedPiMaterialization,
+    },
+}
+
+#[derive(Clone)]
+enum ManagedPiMaterialization {
+    Environment,
+    #[cfg(test)]
+    Explicit {
+        state_root: std::path::PathBuf,
+        auth_source: std::path::PathBuf,
+    },
+}
+
+impl ManagedPiMaterialization {
+    fn profile(&self) -> Result<ManagedPiProfile> {
+        match self {
+            Self::Environment => ManagedPiProfile::from_environment(),
+            #[cfg(test)]
+            Self::Explicit {
+                state_root,
+                auth_source,
+            } => ManagedPiProfile::materialize(state_root, auth_source),
+        }
+    }
 }
 
 impl ProcessSource {
@@ -125,6 +152,7 @@ impl ProcessSource {
         match self {
             Self::Static(spec) => &spec.display_name,
             Self::ManagedNvim { .. } => "nvim",
+            Self::ManagedPi { .. } => "pi",
         }
     }
 
@@ -146,6 +174,10 @@ impl ProcessSource {
                 *current = Some(generation);
                 Ok(spec)
             }
+            Self::ManagedPi {
+                workspace,
+                materialization,
+            } => materialization.profile()?.process_spec(workspace),
         }
     }
 
@@ -192,11 +224,7 @@ impl SessionRegistry {
                 workspace,
             )),
             LaunchMode::Nvim => managed_nvim_source(workspace)?,
-            LaunchMode::Pi => ProcessSource::Static(checked_process_spec(
-                PiBackend,
-                BackendKind::Agent,
-                workspace,
-            )),
+            LaunchMode::Pi => managed_pi_source(workspace),
             LaunchMode::Workbench => unreachable!("workbench uses multiple slots"),
         };
         Ok(Self::from_sources(
@@ -224,11 +252,7 @@ impl SessionRegistry {
                 ),
                 (
                     SessionKey::Pane(PaneId::Agent),
-                    ProcessSource::Static(checked_process_spec(
-                        PiBackend,
-                        BackendKind::Agent,
-                        workspace,
-                    )),
+                    managed_pi_source(workspace),
                     terminal_content_size(layout.agent),
                 ),
                 (
@@ -265,6 +289,7 @@ impl SessionRegistry {
                     let spec = match &source {
                         ProcessSource::Static(spec) => spec.clone(),
                         ProcessSource::ManagedNvim { .. } => ProcessSpec::new("nvim"),
+                        ProcessSource::ManagedPi { .. } => ProcessSpec::new("pi"),
                     };
                     (
                         key,
@@ -1381,6 +1406,13 @@ impl Drop for AppRuntime {
     }
 }
 
+fn managed_pi_source(workspace: &Workspace) -> ProcessSource {
+    ProcessSource::ManagedPi {
+        workspace: workspace.clone(),
+        materialization: ManagedPiMaterialization::Environment,
+    }
+}
+
 fn managed_nvim_source(workspace: &Workspace) -> Result<ProcessSource> {
     let profile = ManagedNvimProfile::from_environment()?;
     Ok(ProcessSource::ManagedNvim {
@@ -1944,14 +1976,14 @@ mod tests {
             ProcessSource::ManagedNvim { controller, .. } => {
                 controller.endpoint().unwrap().to_path_buf()
             }
-            ProcessSource::Static(_) => unreachable!(),
+            ProcessSource::Static(_) | ProcessSource::ManagedPi { .. } => unreachable!(),
         };
         source.next_spec().unwrap();
         let second = match &source {
             ProcessSource::ManagedNvim { controller, .. } => {
                 controller.endpoint().unwrap().to_path_buf()
             }
-            ProcessSource::Static(_) => unreachable!(),
+            ProcessSource::Static(_) | ProcessSource::ManagedPi { .. } => unreachable!(),
         };
         assert_ne!(first, second);
         assert!(!first.exists());
@@ -1960,7 +1992,7 @@ mod tests {
             ProcessSource::ManagedNvim { controller, .. } => {
                 controller.remote_open_spec("replacement.txt").unwrap()
             }
-            ProcessSource::Static(_) => unreachable!(),
+            ProcessSource::Static(_) | ProcessSource::ManagedPi { .. } => unreachable!(),
         };
         assert_eq!(remote.args[1], second.to_string_lossy());
         source.cleanup();
@@ -2011,6 +2043,35 @@ mod tests {
                 .values()
                 .all(|slot| slot.size == TerminalSize::new(40, 12))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_pi_preparation_failure_is_lazy_and_retryable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = temp.path().join("workspace");
+        let auth_dir = temp.path().join("shared");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        std::fs::create_dir(&auth_dir).unwrap();
+        let auth = auth_dir.join("auth.json");
+        std::fs::write(&auth, b"RETRY-SECRET-MARKER").unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let workspace = Workspace::discover(workspace_dir).unwrap();
+        let mut source = ProcessSource::ManagedPi {
+            workspace,
+            materialization: ManagedPiMaterialization::Explicit {
+                state_root: temp.path().join("state"),
+                auth_source: auth.clone(),
+            },
+        };
+
+        let error = source.next_spec().unwrap_err();
+        assert!(!format!("{error:?}").contains("RETRY-SECRET-MARKER"));
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let spec = source.next_spec().unwrap();
+        assert_eq!(spec.display_name, "pi");
     }
 
     #[test]
