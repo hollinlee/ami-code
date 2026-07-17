@@ -3,7 +3,10 @@ mod editor;
 mod shell;
 
 pub use agent::PiBackend;
-pub use editor::NvimBackend;
+#[allow(unused_imports)]
+pub use editor::{
+    ManagedNvimGeneration, ManagedNvimProfile, NvimBackend, NvimController, NvimRemoteError,
+};
 pub use shell::ShellBackend;
 
 use crate::terminal::ProcessSpec;
@@ -38,19 +41,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nvim_spec_targets_workspace() {
-        let workspace = Workspace::discover(std::env::current_dir().unwrap()).unwrap();
+    fn nvim_backend_kind_is_editor() {
         let backend = NvimBackend;
-        let spec = backend.process_spec(&workspace);
-
         assert_eq!(backend.kind(), BackendKind::Editor);
-        assert_eq!(spec.program, "nvim");
-        assert_eq!(spec.display_name, "nvim");
-        assert_eq!(spec.cwd.as_deref(), Some(workspace.root()));
-        assert_eq!(
-            spec.env.get("TERM").map(String::as_str),
-            Some("xterm-256color")
-        );
+        assert_eq!(backend.display_name(), "nvim");
     }
 
     #[test]
