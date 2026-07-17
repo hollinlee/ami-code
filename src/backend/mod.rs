@@ -2,7 +2,7 @@ mod agent;
 mod editor;
 mod shell;
 
-pub use agent::PiBackend;
+pub use agent::ManagedPiProfile;
 #[allow(unused_imports)]
 pub use editor::{
     ManagedNvimGeneration, ManagedNvimProfile, NvimBackend, NvimController, NvimRemoteError,
@@ -45,21 +45,5 @@ mod tests {
         let backend = NvimBackend;
         assert_eq!(backend.kind(), BackendKind::Editor);
         assert_eq!(backend.display_name(), "nvim");
-    }
-
-    #[test]
-    fn pi_spec_targets_workspace() {
-        let workspace = Workspace::discover(std::env::current_dir().unwrap()).unwrap();
-        let backend = PiBackend;
-        let spec = backend.process_spec(&workspace);
-
-        assert_eq!(backend.kind(), BackendKind::Agent);
-        assert_eq!(spec.program, "pi");
-        assert_eq!(spec.display_name, "pi");
-        assert_eq!(spec.cwd.as_deref(), Some(workspace.root()));
-        assert_eq!(
-            spec.env.get("TERM").map(String::as_str),
-            Some("xterm-256color")
-        );
     }
 }
