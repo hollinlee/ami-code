@@ -3,18 +3,22 @@
 //! Filesystem and Git operations run on one bounded background worker. Callers
 //! drive completion by calling [`Sidebar::tick`].
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Default maximum number of children loaded from one directory.
 pub const DEFAULT_ENTRY_CAP: usize = 10_000;
+const GIT_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone)]
 pub struct SidebarConfig {
@@ -136,6 +140,7 @@ enum Job {
     Git {
         id: u64,
         root: PathBuf,
+        cap: usize,
     },
 }
 
@@ -165,6 +170,28 @@ struct LoadedEntry {
     error: Option<String>,
 }
 
+struct RankedLoadedEntry(LoadedEntry);
+
+impl PartialEq for RankedLoadedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        loaded_entry_cmp(&self.0, &other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedLoadedEntry {}
+
+impl PartialOrd for RankedLoadedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedLoadedEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        loaded_entry_cmp(&self.0, &other.0)
+    }
+}
+
 /// Stateful, non-blocking sidebar model.
 ///
 /// `request_*`, `click_visible_row`, and `tick` never perform filesystem or
@@ -181,8 +208,10 @@ pub struct Sidebar {
     next_id: u64,
     pending_loads: HashMap<PathBuf, u64>,
     pending_git: Option<u64>,
+    git_refresh_due: bool,
     last_git_request: Instant,
     git_error: Option<String>,
+    git_changes: Vec<GitChange>,
 }
 
 impl Sidebar {
@@ -236,8 +265,10 @@ impl Sidebar {
             next_id: 1,
             pending_loads: HashMap::new(),
             pending_git: None,
+            git_refresh_due: false,
             last_git_request: Instant::now(),
             git_error: None,
+            git_changes: Vec::new(),
         })
     }
 
@@ -291,20 +322,6 @@ impl Sidebar {
         }
     }
 
-    /// Invalidates and reloads an expanded directory. Older in-flight replies
-    /// are rejected by request id.
-    pub fn request_reload(&mut self, path: &Path) -> bool {
-        if let Some(node) = self.nodes.get_mut(path) {
-            if !node.kind.is_directory() {
-                return false;
-            }
-            node.loaded = false;
-        } else {
-            return false;
-        }
-        self.request_expand(path)
-    }
-
     pub fn collapse(&mut self, path: &Path) {
         if let Some(node) = self.nodes.get_mut(path) {
             node.expanded = false;
@@ -321,13 +338,23 @@ impl Sidebar {
         match self.jobs.try_send(Job::Git {
             id,
             root: self.root.clone(),
+            cap: self.config.entry_cap,
         }) {
             Ok(()) => {
                 self.pending_git = Some(id);
+                self.git_refresh_due = false;
                 self.last_git_request = Instant::now();
                 true
             }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_)) => {
+                self.git_refresh_due = true;
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.git_error = Some("sidebar worker is unavailable".to_owned());
+                self.git_refresh_due = false;
+                false
+            }
         }
     }
 
@@ -335,16 +362,12 @@ impl Sidebar {
     /// refreshes. Returns `true` if model state changed.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            match self.responses.try_recv() {
-                Ok(response) => {
-                    changed |= self.apply_response(response);
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(response) = self.responses.try_recv() {
+            changed |= self.apply_response(response);
         }
         if self.pending_git.is_none()
-            && self.last_git_request.elapsed() >= self.config.git_refresh_interval
+            && (self.git_refresh_due
+                || self.last_git_request.elapsed() >= self.config.git_refresh_interval)
         {
             self.request_git_refresh();
         }
@@ -361,7 +384,8 @@ impl Sidebar {
     }
 
     /// All expanded rows, before scroll/viewport clipping.
-    pub fn all_visible_rows(&self) -> Vec<SidebarRow> {
+    #[cfg(test)]
+    fn all_visible_rows(&self) -> Vec<SidebarRow> {
         self.flatten_rows()
     }
 
@@ -396,10 +420,7 @@ impl Sidebar {
         self.scroll = self.scroll.saturating_add_signed(delta).min(maximum);
     }
 
-    pub fn scroll_offset(&self) -> usize {
-        self.scroll
-    }
-
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_deref()
     }
@@ -493,6 +514,7 @@ impl Sidebar {
                         }
                     }
                 }
+                self.reconcile_git();
                 true
             }
             Response::Git { id, result } => {
@@ -507,6 +529,7 @@ impl Sidebar {
                     }
                     Err(error) => {
                         self.git_error = Some(error);
+                        self.git_changes.clear();
                         self.clear_git();
                     }
                 }
@@ -543,49 +566,52 @@ impl Sidebar {
     }
 
     fn apply_git(&mut self, changes: Vec<GitChange>) {
+        self.git_changes = changes;
+        self.reconcile_git();
+    }
+
+    fn reconcile_git(&mut self) {
         self.clear_git();
-        for change in changes {
+        for change in self.git_changes.clone() {
             let Some(path) = safe_join(&self.root, &change.path) else {
                 continue;
             };
-            if change.status == GitStatus::Deleted && !self.nodes.contains_key(&path) {
-                if let Some(parent_path) = path.parent() {
-                    let visible_parent = self
-                        .nodes
-                        .get(parent_path)
-                        .is_some_and(|node| node.loaded && node.expanded);
-                    if visible_parent {
-                        let name = path.file_name().unwrap_or_default().to_os_string();
-                        self.nodes.insert(
-                            path.clone(),
-                            Node {
-                                name,
-                                kind: EntryKind::Deleted,
-                                expanded: false,
-                                loading: false,
-                                loaded: true,
-                                error: None,
-                                children: Vec::new(),
-                                canonical_dir: None,
-                                synthetic_deleted: true,
-                                git: GitDecoration {
-                                    status: Some(GitStatus::Deleted),
-                                    dirty_descendant: false,
-                                },
+            if change.status == GitStatus::Deleted
+                && !self.nodes.contains_key(&path)
+                && let Some(parent_path) = path.parent()
+            {
+                let visible_parent = self.nodes.get(parent_path).is_some_and(|node| node.loaded);
+                if visible_parent {
+                    let name = path.file_name().unwrap_or_default().to_os_string();
+                    self.nodes.insert(
+                        path.clone(),
+                        Node {
+                            name,
+                            kind: EntryKind::Deleted,
+                            expanded: false,
+                            loading: false,
+                            loaded: true,
+                            error: None,
+                            children: Vec::new(),
+                            canonical_dir: None,
+                            synthetic_deleted: true,
+                            git: GitDecoration {
+                                status: Some(GitStatus::Deleted),
+                                dirty_descendant: false,
                             },
-                        );
-                        let mut children = self
-                            .nodes
-                            .get_mut(parent_path)
-                            .map(|parent| {
-                                parent.children.push(path.clone());
-                                std::mem::take(&mut parent.children)
-                            })
-                            .unwrap_or_default();
-                        sort_child_paths(&mut children, &self.nodes);
-                        if let Some(parent) = self.nodes.get_mut(parent_path) {
-                            parent.children = children;
-                        }
+                        },
+                    );
+                    let mut children = self
+                        .nodes
+                        .get_mut(parent_path)
+                        .map(|parent| {
+                            parent.children.push(path.clone());
+                            std::mem::take(&mut parent.children)
+                        })
+                        .unwrap_or_default();
+                    sort_child_paths(&mut children, &self.nodes);
+                    if let Some(parent) = self.nodes.get_mut(parent_path) {
+                        parent.children = children;
                     }
                 }
             }
@@ -645,9 +671,9 @@ fn worker(jobs: Receiver<Job>, responses: SyncSender<Response>) {
                 path: path.clone(),
                 result: load_directory(&root, &path, &ancestor_targets, cap),
             },
-            Job::Git { id, root } => Response::Git {
+            Job::Git { id, root, cap } => Response::Git {
                 id,
-                result: load_git(&root),
+                result: load_git(&root, cap),
             },
         };
         if responses.send(response).is_err() {
@@ -677,7 +703,8 @@ fn load_directory(
 
     let read = fs::read_dir(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let mut entries = Vec::new();
+    let mut entries = BinaryHeap::with_capacity(cap);
+    let mut truncated = false;
     for item in read {
         let item = item.map_err(|error| format!("failed to read directory entry: {error}"))?;
         let name = item.file_name();
@@ -721,23 +748,31 @@ fn load_directory(
         } else {
             (EntryKind::Other, None, None)
         };
-        entries.push(LoadedEntry {
+        let candidate = RankedLoadedEntry(LoadedEntry {
             path: entry_path,
             name,
             kind,
             canonical_dir,
             error,
         });
+        if entries.len() < cap {
+            entries.push(candidate);
+        } else {
+            truncated = true;
+            if entries
+                .peek()
+                .is_some_and(|largest| loaded_entry_cmp(&candidate.0, &largest.0).is_lt())
+            {
+                entries.pop();
+                entries.push(candidate);
+            }
+        }
     }
-    entries.sort_by(|left, right| {
-        let left_group = usize::from(!left.kind.is_directory());
-        let right_group = usize::from(!right.kind.is_directory());
-        left_group
-            .cmp(&right_group)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    let truncated = entries.len() > cap;
-    entries.truncate(cap);
+    let mut entries = entries
+        .into_iter()
+        .map(|ranked| ranked.0)
+        .collect::<Vec<_>>();
+    entries.sort_by(loaded_entry_cmp);
     Ok(LoadedDirectory {
         canonical,
         entries,
@@ -745,78 +780,230 @@ fn load_directory(
     })
 }
 
-fn load_git(root: &Path) -> Result<Vec<GitChange>, String> {
-    let output = Command::new("git")
+fn loaded_entry_cmp(left: &LoadedEntry, right: &LoadedEntry) -> Ordering {
+    let left_group = usize::from(!left.kind.is_directory());
+    let right_group = usize::from(!right.kind.is_directory());
+    left_group
+        .cmp(&right_group)
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.path.cmp(&right.path))
+}
+
+fn load_git(root: &Path, cap: usize) -> Result<Vec<GitChange>, String> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain=v2", "-z", "--untracked-files=all"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("failed to run git status: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture git status output".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture git status errors".to_owned())?;
+    let (reader_tx, reader_rx) = mpsc::channel();
+    let stdout_tx = reader_tx.clone();
+    thread::spawn(move || {
+        let _ = stdout_tx.send((true, read_capped(stdout, GIT_OUTPUT_CAP_BYTES)));
+    });
+    thread::spawn(move || {
+        let _ = reader_tx.send((false, read_capped(stderr, GIT_OUTPUT_CAP_BYTES)));
+    });
+
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
+            Ok(None) => {
+                terminate_git_processes(&mut child)
+                    .map_err(|error| format!("failed to stop timed-out git status: {error}"))?;
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("failed to reap timed-out git status: {error}"))?;
+                break (status, true);
+            }
+            Err(error) => {
+                let _ = terminate_git_processes(&mut child);
+                let _ = child.wait();
+                return Err(format!("failed to wait for git status: {error}"));
+            }
+        }
+    };
+
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let mut pipe_deadline = if timed_out {
+        Instant::now() + PROCESS_POLL_INTERVAL * 10
+    } else {
+        deadline
+    };
+    let mut group_terminated = timed_out;
+    while stdout_result.is_none() || stderr_result.is_none() {
+        let remaining = pipe_deadline.saturating_duration_since(Instant::now());
+        match reader_rx.recv_timeout(remaining) {
+            Ok((is_stdout, result)) => {
+                if is_stdout {
+                    stdout_result = Some(result);
+                } else {
+                    stderr_result = Some(result);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if !group_terminated => {
+                terminate_git_processes(&mut child)
+                    .map_err(|error| format!("failed to stop git status pipe holders: {error}"))?;
+                group_terminated = true;
+                pipe_deadline = Instant::now() + PROCESS_POLL_INTERVAL * 10;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(
+                    "git status pipes remained open after process-group termination".into(),
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("git status pipe readers disconnected".into());
+            }
+        }
+    }
+    let (stdout, stdout_truncated) = stdout_result
+        .expect("stdout result checked")
+        .map_err(|error| format!("failed to read git status stdout: {error}"))?;
+    let (stderr, stderr_truncated) = stderr_result
+        .expect("stderr result checked")
+        .map_err(|error| format!("failed to read git status stderr: {error}"))?;
+    if timed_out {
+        return Err(format!(
+            "git status timed out after {}s",
+            GIT_TIMEOUT.as_secs()
+        ));
+    }
+    if stdout_truncated || stderr_truncated {
+        return Err(format!(
+            "git status output exceeded {} bytes",
+            GIT_OUTPUT_CAP_BYTES
+        ));
+    }
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         return Err(if stderr.trim().is_empty() {
-            format!("git status exited with {}", output.status)
+            format!("git status exited with {status}")
         } else {
             stderr.trim().to_owned()
         });
     }
-    parse_git_porcelain_v2(&output.stdout)
+    parse_git_porcelain_v2_capped(&stdout, cap)
+}
+
+fn read_capped(mut reader: impl Read, cap: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::with_capacity(cap.min(64 * 1024));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = cap.saturating_sub(kept.len());
+        let keep = remaining.min(count);
+        kept.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < count;
+    }
+    Ok((kept, truncated))
+}
+
+#[cfg(unix)]
+fn terminate_git_processes(child: &mut Child) -> io::Result<()> {
+    let group = format!("-{}", child.id());
+    let status = Command::new("kill")
+        .args(["-KILL", group.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_git_processes(child: &mut Child) -> io::Result<()> {
+    child.kill()
 }
 
 /// Parses `git status --porcelain=v2 -z` output.
 ///
 /// Rename/copy records consume the second NUL-delimited original-path field.
-pub fn parse_git_porcelain_v2(bytes: &[u8]) -> Result<Vec<GitChange>, String> {
-    let records: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
+#[cfg(test)]
+fn parse_git_porcelain_v2(bytes: &[u8]) -> Result<Vec<GitChange>, String> {
+    parse_git_porcelain_v2_capped(bytes, DEFAULT_ENTRY_CAP)
+}
+
+fn parse_git_porcelain_v2_capped(bytes: &[u8], cap: usize) -> Result<Vec<GitChange>, String> {
+    let mut records = bytes.split(|byte| *byte == 0);
     let mut changes = Vec::new();
-    let mut index = 0;
-    while index < records.len() {
-        let record = records[index];
-        index += 1;
+    while let Some(record) = records.next() {
         if record.is_empty() || record.starts_with(b"# ") || record.starts_with(b"! ") {
             continue;
         }
-        match record[0] {
+        if changes.len() >= cap {
+            return Err(format!("git change cap reached ({cap})"));
+        }
+        let change = match record[0] {
             b'1' => {
                 let fields = split_n_fields(record, 9)?;
-                changes.push(GitChange {
+                GitChange {
                     status: status_from_xy(fields[1])?,
                     path: bytes_to_path(fields[8]),
                     original_path: None,
-                });
+                }
             }
             b'2' => {
                 let fields = split_n_fields(record, 10)?;
                 let original = records
-                    .get(index)
+                    .next()
                     .ok_or_else(|| "rename record is missing original path".to_owned())?;
-                index += 1;
-                changes.push(GitChange {
+                GitChange {
                     status: status_from_xy(fields[1])?,
                     path: bytes_to_path(fields[9]),
                     original_path: Some(bytes_to_path(original)),
-                });
+                }
             }
             b'u' => {
                 let fields = split_n_fields(record, 11)?;
-                changes.push(GitChange {
+                GitChange {
                     status: GitStatus::Conflict,
                     path: bytes_to_path(fields[10]),
                     original_path: None,
-                });
+                }
             }
             b'?' => {
                 let path = record
                     .strip_prefix(b"? ")
                     .ok_or_else(|| "malformed untracked record".to_owned())?;
-                changes.push(GitChange {
+                GitChange {
                     status: GitStatus::Untracked,
                     path: bytes_to_path(path),
                     original_path: None,
-                });
+                }
             }
             other => return Err(format!("unsupported porcelain v2 record type: {other}")),
-        }
+        };
+        changes.push(change);
     }
     Ok(changes)
 }
@@ -949,6 +1136,11 @@ mod tests {
         assert!(rows.iter().any(|row| row.name == OsStr::new(".hidden")));
         assert!(!rows.iter().any(|row| row.name == OsStr::new(".git")));
         assert!(rows[0].error.as_deref().unwrap().contains("entry cap"));
+        assert_eq!(
+            sidebar.click_visible_row(1, rows.len()).as_deref(),
+            Some(root.join("z-dir").as_path())
+        );
+        assert_eq!(sidebar.selected_path(), Some(root.join("z-dir").as_path()));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -972,6 +1164,13 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
         assert_eq!(parsed[2].status, GitStatus::Conflict);
         assert_eq!(parsed[3].status, GitStatus::Untracked);
         assert_eq!(parsed[4].status, GitStatus::Deleted);
+    }
+
+    #[test]
+    fn parser_rejects_git_snapshots_over_the_change_cap() {
+        let input = b"? first\0? second\0";
+        let error = parse_git_porcelain_v2_capped(input, 1).unwrap_err();
+        assert!(error.contains("change cap"));
     }
 
     #[test]
@@ -1005,6 +1204,40 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
         }
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn latest_git_snapshot_is_reconciled_after_lazy_directory_load() {
+        let root = temp_dir("git-before-expand");
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file"), b"").unwrap();
+        let mut sidebar = Sidebar::new(&root).unwrap();
+        sidebar.request_expand(&root);
+        wait(&mut sidebar);
+        sidebar.apply_git(vec![
+            GitChange {
+                path: PathBuf::from("dir/file"),
+                original_path: None,
+                status: GitStatus::Modified,
+            },
+            GitChange {
+                path: PathBuf::from("dir/gone"),
+                original_path: None,
+                status: GitStatus::Deleted,
+            },
+        ]);
+
+        sidebar.request_expand(&root.join("dir"));
+        wait(&mut sidebar);
+        let rows = sidebar.all_visible_rows();
+        assert!(rows.iter().any(|row| {
+            row.path == root.join("dir/file") && row.git.status == Some(GitStatus::Modified)
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| { row.path == root.join("dir/gone") && row.kind == EntryKind::Deleted })
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
