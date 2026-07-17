@@ -172,6 +172,8 @@ pub enum NvimRemoteError {
     NonUtf8Path(PathBuf),
     #[error("failed to resolve remote-open path: {0}")]
     InvalidPath(#[source] anyhow::Error),
+    #[error("path is not an existing regular file: {0}")]
+    NotRegularFile(PathBuf),
     #[error("failed to execute Nvim remote command: {0}")]
     Command(#[source] io::Error),
     #[error("Nvim remote command failed with {0}")]
@@ -196,11 +198,29 @@ impl NvimController {
     }
 
     pub fn remote_open_spec(&self, path: impl AsRef<Path>) -> Result<ProcessSpec, NvimRemoteError> {
+        let absolute = workspace_safe_path(&self.workspace_root, path.as_ref())?;
+        self.remote_open_spec_for_absolute(absolute)
+    }
+
+    /// Builds a remote-open command only for an existing regular file whose
+    /// canonical target is inside the canonical workspace root. Symlink files
+    /// are accepted; escaping symlinks and every non-regular file are rejected.
+    pub fn existing_file_open_spec(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProcessSpec, NvimRemoteError> {
+        let absolute = workspace_existing_regular_file(&self.workspace_root, path.as_ref())?;
+        self.remote_open_spec_for_absolute(absolute)
+    }
+
+    fn remote_open_spec_for_absolute(
+        &self,
+        absolute: PathBuf,
+    ) -> Result<ProcessSpec, NvimRemoteError> {
         let endpoint = self.endpoint.clone().ok_or(NvimRemoteError::NoEndpoint)?;
         if !endpoint.exists() {
             return Err(NvimRemoteError::NotReady(endpoint));
         }
-        let absolute = workspace_safe_path(&self.workspace_root, path.as_ref())?;
         let endpoint_arg = endpoint
             .to_str()
             .ok_or_else(|| NvimRemoteError::NonUtf8Path(endpoint.clone()))?;
@@ -221,7 +241,15 @@ impl NvimController {
 
     /// Executes a one-shot argv-based remote open. No path is interpreted by a shell.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<(), NvimRemoteError> {
-        let spec = self.remote_open_spec(path)?;
+        self.execute(self.remote_open_spec(path)?)
+    }
+
+    /// Executes the strict existing-regular-file variant used by Sidebar.
+    pub fn open_existing_file(&self, path: impl AsRef<Path>) -> Result<(), NvimRemoteError> {
+        self.execute(self.existing_file_open_spec(path)?)
+    }
+
+    fn execute(&self, spec: ProcessSpec) -> Result<(), NvimRemoteError> {
         let cwd = spec.cwd.as_ref().ok_or_else(|| {
             NvimRemoteError::InvalidPath(anyhow::anyhow!("Nvim controller has no workspace cwd"))
         })?;
@@ -303,6 +331,32 @@ fn workspace_safe_path(root: &Path, requested: &Path) -> Result<PathBuf, NvimRem
     }
     for component in missing.into_iter().rev() {
         resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn workspace_existing_regular_file(
+    root: &Path,
+    requested: &Path,
+) -> Result<PathBuf, NvimRemoteError> {
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let root = root
+        .canonicalize()
+        .map_err(|error| NvimRemoteError::InvalidPath(error.into()))?;
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|error| NvimRemoteError::InvalidPath(error.into()))?;
+    if !resolved.starts_with(&root) {
+        return Err(NvimRemoteError::OutsideWorkspace(candidate));
+    }
+    let metadata =
+        fs::metadata(&resolved).map_err(|error| NvimRemoteError::InvalidPath(error.into()))?;
+    if !metadata.is_file() {
+        return Err(NvimRemoteError::NotRegularFile(candidate));
     }
     Ok(resolved)
 }
@@ -535,6 +589,84 @@ mod tests {
     }
 
     #[test]
+    fn strict_file_open_accepts_nested_files_and_rejects_missing_and_directories() {
+        let root = temp("strict-workspace");
+        fs::create_dir_all(root.join("nested/dir")).unwrap();
+        fs::write(root.join("nested/file.rs"), b"").unwrap();
+        fs::write(root.join("-with spaces ü.rs"), b"").unwrap();
+        let endpoint = root.join("server.sock");
+        fs::write(&endpoint, b"").unwrap();
+        let controller = NvimController::new(root.clone(), Some(endpoint));
+
+        let spec = controller
+            .existing_file_open_spec("nested/file.rs")
+            .unwrap();
+        assert_eq!(
+            Path::new(&spec.args[3]),
+            root.join("nested/file.rs").canonicalize().unwrap()
+        );
+        let special = controller
+            .existing_file_open_spec("-with spaces ü.rs")
+            .unwrap();
+        assert_eq!(special.args.len(), 4);
+        assert_eq!(
+            Path::new(&special.args[3]),
+            root.join("-with spaces ü.rs").canonicalize().unwrap()
+        );
+        assert!(matches!(
+            controller.existing_file_open_spec("missing"),
+            Err(NvimRemoteError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            controller.existing_file_open_spec("nested/dir"),
+            Err(NvimRemoteError::NotRegularFile(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_file_open_accepts_safe_symlink_and_rejects_escape_and_fifo() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp("strict-links");
+        let outside = temp("strict-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("target"), b"").unwrap();
+        fs::write(outside.join("outside"), b"").unwrap();
+        symlink(root.join("target"), root.join("safe-link")).unwrap();
+        symlink(outside.join("outside"), root.join("escape-link")).unwrap();
+        let fifo = root.join("fifo");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let endpoint = root.join("server.sock");
+        fs::write(&endpoint, b"").unwrap();
+        let controller = NvimController::new(root.clone(), Some(endpoint));
+
+        let spec = controller.existing_file_open_spec("safe-link").unwrap();
+        assert_eq!(
+            Path::new(&spec.args[3]),
+            root.join("target").canonicalize().unwrap()
+        );
+        assert!(matches!(
+            controller.existing_file_open_spec("escape-link"),
+            Err(NvimRemoteError::OutsideWorkspace(_))
+        ));
+        assert!(matches!(
+            controller.existing_file_open_spec("fifo"),
+            Err(NvimRemoteError::NotRegularFile(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
     fn readiness_errors_are_distinct() {
         let root = temp("workspace");
         fs::create_dir_all(&root).unwrap();
@@ -579,9 +711,11 @@ mod tests {
             generation.endpoint().exists(),
             "Nvim listen socket was not ready"
         );
+        let opened = root.join("new file ü.txt");
+        fs::write(&opened, b"").unwrap();
         generation
             .controller(&workspace)
-            .open("new file ü.txt")
+            .open_existing_file(&opened)
             .unwrap();
         let status = Command::new("nvim")
             .args([
