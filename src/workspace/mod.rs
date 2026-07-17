@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+pub mod sidebar;
+
 use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
