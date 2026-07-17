@@ -79,6 +79,14 @@ pub struct GitChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarActivation {
+    /// A file-like row that may be validated and opened by the backend.
+    OpenFile(PathBuf),
+    /// A real row was selected, but it must not cause an editor open.
+    SelectOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
     pub path: PathBuf,
     pub name: OsString,
@@ -390,7 +398,15 @@ impl Sidebar {
     }
 
     /// Selects a row relative to the current viewport and toggles directories.
-    pub fn click_visible_row(&mut self, row: usize, viewport_rows: usize) -> Option<PathBuf> {
+    ///
+    /// Only file and error-free symlink rows produce an open activation. The
+    /// controller performs the authoritative, synchronous filesystem check at
+    /// activation time, so a row deleted or replaced after loading is rejected.
+    pub fn click_visible_row(
+        &mut self,
+        row: usize,
+        viewport_rows: usize,
+    ) -> Option<SidebarActivation> {
         if row >= viewport_rows {
             return None;
         }
@@ -400,10 +416,10 @@ impl Sidebar {
             .path
             .clone();
         self.selected = Some(path.clone());
-        let directory = self
-            .nodes
-            .get(&path)
-            .is_some_and(|node| node.kind.is_directory());
+        let node = self.nodes.get(&path)?;
+        let directory = node.kind.is_directory();
+        let open_file =
+            matches!(node.kind, EntryKind::File | EntryKind::Symlink) && node.error.is_none();
         if directory {
             if self.nodes.get(&path).is_some_and(|node| node.expanded) {
                 self.collapse(&path);
@@ -411,7 +427,11 @@ impl Sidebar {
                 self.request_expand(&path);
             }
         }
-        Some(path)
+        Some(if open_file {
+            SidebarActivation::OpenFile(path)
+        } else {
+            SidebarActivation::SelectOnly
+        })
     }
 
     pub fn scroll(&mut self, delta: isize, viewport_rows: usize) {
@@ -1137,10 +1157,40 @@ mod tests {
         assert!(!rows.iter().any(|row| row.name == OsStr::new(".git")));
         assert!(rows[0].error.as_deref().unwrap().contains("entry cap"));
         assert_eq!(
-            sidebar.click_visible_row(1, rows.len()).as_deref(),
-            Some(root.join("z-dir").as_path())
+            sidebar.click_visible_row(1, rows.len()),
+            Some(SidebarActivation::SelectOnly)
         );
         assert_eq!(sidebar.selected_path(), Some(root.join("z-dir").as_path()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn click_activation_only_emits_file_candidates() {
+        let root = temp_dir("activation");
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("file"), b"").unwrap();
+        let mut sidebar = Sidebar::new(&root).unwrap();
+        sidebar.request_expand(&root);
+        wait(&mut sidebar);
+        let rows = sidebar.all_visible_rows();
+        let directory = rows
+            .iter()
+            .position(|row| row.path == root.join("dir"))
+            .unwrap();
+        let file = rows
+            .iter()
+            .position(|row| row.path == root.join("file"))
+            .unwrap();
+
+        assert_eq!(
+            sidebar.click_visible_row(directory, rows.len()),
+            Some(SidebarActivation::SelectOnly)
+        );
+        assert_eq!(
+            sidebar.click_visible_row(file, rows.len()),
+            Some(SidebarActivation::OpenFile(root.join("file")))
+        );
+        assert_eq!(sidebar.click_visible_row(rows.len(), rows.len()), None);
         fs::remove_dir_all(root).unwrap();
     }
 

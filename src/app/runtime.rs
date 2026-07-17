@@ -33,7 +33,7 @@ use crate::workbench::{
     WorkbenchLayoutConfig, WorkbenchState, hit_test, shell_tab_hit_test,
 };
 use crate::workspace::Workspace;
-use crate::workspace::sidebar::Sidebar;
+use crate::workspace::sidebar::{Sidebar, SidebarActivation};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SCROLLBACK_LINES: usize = 1_000;
@@ -94,6 +94,13 @@ enum PasteDelivery {
     Unavailable,
     Rejected(String),
     BackendFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileOpenDelivery {
+    Opened,
+    Unavailable,
+    Failed(String),
 }
 
 enum SlotState {
@@ -439,6 +446,31 @@ impl SessionRegistry {
                 Ok(PasteDelivery::BackendFailed)
             }
         }
+    }
+
+    fn open_editor_file(&self, path: &std::path::Path) -> FileOpenDelivery {
+        self.open_editor_file_with(path, |controller, path| {
+            controller
+                .open_existing_file(path)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// The injected operation is a one-shot seam for proving that availability
+    /// checks neither queue nor duplicate an open across managed generations.
+    fn open_editor_file_with<F>(&self, path: &std::path::Path, open: F) -> FileOpenDelivery
+    where
+        F: FnOnce(&NvimController, &std::path::Path) -> Result<(), String>,
+    {
+        let Some(slot) = self.slots.get(&SessionKey::Pane(PaneId::Editor)) else {
+            return FileOpenDelivery::Unavailable;
+        };
+        open_managed_nvim_source_file_with(
+            &slot.source,
+            matches!(slot.state, SlotState::Running { .. }),
+            path,
+            open,
+        )
     }
 
     fn status(&self, key: SessionKey, now: Instant, click_retry: bool) -> Option<String> {
@@ -968,7 +1000,7 @@ impl AppRuntime {
             );
             return;
         }
-        let status = self
+        let lifecycle_status = self
             .sessions
             .status(
                 session_key(&self.workbench, pane),
@@ -976,6 +1008,7 @@ impl AppRuntime {
                 self.launch_mode.is_workbench(),
             )
             .unwrap_or_else(|| "unavailable".to_string());
+        let status = unavailable_pane_status(pane, &lifecycle_status, self.status.as_deref());
         let display_name = self
             .sessions
             .slots
@@ -1308,8 +1341,16 @@ impl AppRuntime {
                     .layout
                     .map(|layout| sidebar_viewport_rows(layout.sidebar))
                     .unwrap_or(0);
-                if let Some(sidebar) = &mut self.sidebar {
-                    sidebar.click_visible_row(row, viewport_rows);
+                let activation = self
+                    .sidebar
+                    .as_mut()
+                    .and_then(|sidebar| sidebar.click_visible_row(row, viewport_rows));
+                if let Some(SidebarActivation::OpenFile(path)) = activation {
+                    apply_sidebar_open_result(
+                        &mut self.workbench,
+                        &mut self.status,
+                        self.sessions.open_editor_file(&path),
+                    );
                 }
             }
             return Ok(());
@@ -1471,6 +1512,65 @@ impl AppRuntime {
 impl Drop for AppRuntime {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn open_managed_nvim_source_file_with<F>(
+    source: &ProcessSource,
+    running: bool,
+    path: &std::path::Path,
+    open: F,
+) -> FileOpenDelivery
+where
+    F: FnOnce(&NvimController, &std::path::Path) -> Result<(), String>,
+{
+    if !running {
+        return FileOpenDelivery::Unavailable;
+    }
+    let ProcessSource::ManagedNvim {
+        current: Some(_),
+        controller,
+        ..
+    } = source
+    else {
+        return FileOpenDelivery::Unavailable;
+    };
+    match open(controller, path) {
+        Ok(()) => FileOpenDelivery::Opened,
+        Err(error) => FileOpenDelivery::Failed(error),
+    }
+}
+
+fn unavailable_pane_status(
+    pane: PaneId,
+    lifecycle_status: &str,
+    action_status: Option<&str>,
+) -> String {
+    if pane == PaneId::Editor
+        && let Some(action_status) = action_status
+    {
+        format!("{action_status}; {lifecycle_status}")
+    } else {
+        lifecycle_status.to_owned()
+    }
+}
+
+fn apply_sidebar_open_result(
+    workbench: &mut WorkbenchState,
+    status: &mut Option<String>,
+    result: FileOpenDelivery,
+) {
+    match result {
+        FileOpenDelivery::Opened => {
+            workbench.focus_pane(PaneId::Editor);
+            *status = None;
+        }
+        FileOpenDelivery::Unavailable => {
+            *status = Some("editor unavailable; file was not opened".to_string());
+        }
+        FileOpenDelivery::Failed(error) => {
+            *status = Some(format!("failed to open file in editor: {error}"));
+        }
     }
 }
 
@@ -2104,6 +2204,113 @@ mod tests {
         source.cleanup();
         assert!(!second.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_editor_composes_file_action_and_lifecycle_status() {
+        assert_eq!(
+            unavailable_pane_status(
+                PaneId::Editor,
+                "starting…",
+                Some("editor unavailable; file was not opened")
+            ),
+            "editor unavailable; file was not opened; starting…"
+        );
+        assert_eq!(
+            unavailable_pane_status(PaneId::Agent, "starting…", Some("clipboard error")),
+            "starting…"
+        );
+    }
+
+    #[test]
+    fn sidebar_open_focuses_editor_only_on_success_and_reports_failures() {
+        let mut workbench = WorkbenchState::default();
+        workbench.focus_pane(PaneId::Sidebar);
+        let mut status = Some("old".to_string());
+
+        apply_sidebar_open_result(&mut workbench, &mut status, FileOpenDelivery::Unavailable);
+        assert_eq!(workbench.focused_pane(), PaneId::Sidebar);
+        assert_eq!(
+            status.as_deref(),
+            Some("editor unavailable; file was not opened")
+        );
+
+        apply_sidebar_open_result(
+            &mut workbench,
+            &mut status,
+            FileOpenDelivery::Failed("remote failed".to_string()),
+        );
+        assert_eq!(workbench.focused_pane(), PaneId::Sidebar);
+        assert!(status.as_deref().unwrap().contains("remote failed"));
+
+        apply_sidebar_open_result(&mut workbench, &mut status, FileOpenDelivery::Opened);
+        assert_eq!(workbench.focused_pane(), PaneId::Editor);
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn managed_nvim_file_open_calls_once_only_while_current_generation_is_running() {
+        use std::cell::Cell;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let file = workspace_dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let workspace = Workspace::discover(&workspace_dir).unwrap();
+        let profile = ManagedNvimProfile::materialize(temp.path().join("state")).unwrap();
+        let mut source = ProcessSource::ManagedNvim {
+            profile,
+            workspace: workspace.clone(),
+            current: None,
+            controller: NvimController::new(workspace.root().to_path_buf(), None),
+        };
+        source.next_spec().unwrap();
+        let calls = Cell::new(0);
+        let result = open_managed_nvim_source_file_with(&source, true, &file, |_, opened| {
+            calls.set(calls.get() + 1);
+            assert_eq!(opened, file);
+            Ok(())
+        });
+        assert_eq!(result, FileOpenDelivery::Opened);
+        assert_eq!(calls.get(), 1);
+
+        let result = open_managed_nvim_source_file_with(&source, false, &file, |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(result, FileOpenDelivery::Unavailable);
+        assert_eq!(calls.get(), 1);
+        source.cleanup();
+    }
+
+    #[test]
+    fn managed_nvim_file_open_failure_is_not_retried() {
+        use std::cell::Cell;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = Workspace::discover(&workspace_dir).unwrap();
+        let profile = ManagedNvimProfile::materialize(temp.path().join("state")).unwrap();
+        let mut source = ProcessSource::ManagedNvim {
+            profile,
+            workspace: workspace.clone(),
+            current: None,
+            controller: NvimController::new(workspace.root().to_path_buf(), None),
+        };
+        source.next_spec().unwrap();
+        let calls = Cell::new(0);
+        let result = open_managed_nvim_source_file_with(&source, true, workspace.root(), |_, _| {
+            calls.set(calls.get() + 1);
+            Err("remote failed".to_string())
+        });
+        assert_eq!(
+            result,
+            FileOpenDelivery::Failed("remote failed".to_string())
+        );
+        assert_eq!(calls.get(), 1);
+        source.cleanup();
     }
 
     #[test]
