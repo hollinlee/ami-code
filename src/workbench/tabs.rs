@@ -81,6 +81,9 @@ pub enum ShellTabTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShellTabGeometry {
     pub id: ShellTabId,
+    /// One-based position in the current ordered tab list. Unlike `id`, this
+    /// is presentation-only and closes gaps after tabs are removed.
+    pub display_number: usize,
     pub x: u16,
     pub width: u16,
     pub close_x: u16,
@@ -111,13 +114,18 @@ pub fn shell_tab_geometry(
     start = start.min(tabs.len().saturating_sub(capacity));
     let mut result = Vec::with_capacity(capacity);
     let mut x = area.x + 1;
-    for id in tabs.tabs[start..start + capacity].iter().copied() {
+    for (offset, id) in tabs.tabs[start..start + capacity]
+        .iter()
+        .copied()
+        .enumerate()
+    {
         let width = TAB_WIDTH.min(plus_x.saturating_sub(x));
         if width == 0 {
             break;
         }
         result.push(ShellTabGeometry {
             id,
+            display_number: start + offset + 1,
             x,
             width,
             close_x: x + width - 1,
@@ -185,6 +193,24 @@ mod tests {
         let (_, replacement) = tabs.close(ShellTabId(1)).unwrap();
         assert_eq!(replacement, Some(ShellTabId(2)));
         assert_eq!(tabs.new_tab(), ShellTabId(3));
+    }
+
+    #[test]
+    fn display_numbers_follow_current_order_not_historical_ids() {
+        let mut tabs = ShellTabs::default();
+        let two = tabs.new_tab();
+        let three = tabs.new_tab();
+        tabs.close(two);
+        let four = tabs.new_tab();
+
+        let (geometry, _) = shell_tab_geometry(Rect::new(0, 0, 40, 10), &tabs);
+        assert_eq!(
+            geometry
+                .iter()
+                .map(|tab| (tab.id, tab.display_number))
+                .collect::<Vec<_>>(),
+            vec![(ShellTabId(1), 1), (three, 2), (four, 3)]
+        );
     }
 
     #[test]

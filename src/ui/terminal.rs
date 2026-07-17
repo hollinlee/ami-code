@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::{TerminalPoint, TerminalRange, TerminalSize};
-use crate::workbench::{ShellTabId, ShellTabs, shell_tab_geometry};
+use crate::workbench::{ShellTabs, shell_tab_geometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalPaneStyle {
@@ -91,7 +91,7 @@ pub fn render_shell_terminal_pane(
     let (geometry, plus) = shell_tab_geometry(area, view.tabs);
     for tab in geometry {
         let active = tab.id == view.tabs.active();
-        let label = tab_label(tab.id, tab.width, active);
+        let label = tab_label(tab.display_number, tab.width, active);
         let style = if active {
             Style::default()
                 .fg(Color::Black)
@@ -132,9 +132,9 @@ pub fn render_shell_terminal_pane(
     }
 }
 
-fn tab_label(id: ShellTabId, width: u16, active: bool) -> String {
+fn tab_label(display_number: usize, width: u16, active: bool) -> String {
     let marker = if active { "●" } else { " " };
-    let raw = format!("{marker}{} ×", id.0);
+    let raw = format!("{marker}{display_number} ×");
     let mut chars: String = raw.chars().take(width as usize).collect();
     while chars.chars().count() < width as usize {
         chars.push(' ');
