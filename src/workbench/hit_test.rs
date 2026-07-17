@@ -23,6 +23,7 @@ pub enum MouseTarget {
     Divider(LayoutDivider),
     Sidebar,
     Border(PaneId),
+    ShellTabStrip,
     Content { pane: PaneId, row: u16, col: u16 },
 }
 
@@ -31,7 +32,7 @@ impl MouseTarget {
         match self {
             Self::Sidebar => Some(PaneId::Sidebar),
             Self::Border(pane) | Self::Content { pane, .. } => Some(pane),
-            Self::Handle(_) | Self::Divider(_) => None,
+            Self::Handle(_) | Self::Divider(_) | Self::ShellTabStrip => None,
         }
     }
 }
@@ -98,9 +99,12 @@ pub fn hit_test(layout: WorkbenchLayout, column: u16, row: u16) -> Option<MouseT
         if is_border(area, column, row) {
             return Some(MouseTarget::Border(pane));
         }
+        if pane == PaneId::Bottom && row == area.y + 1 {
+            return Some(MouseTarget::ShellTabStrip);
+        }
         return Some(MouseTarget::Content {
             pane,
-            row: row - area.y - 1,
+            row: row - area.y - if pane == PaneId::Bottom { 2 } else { 1 },
             col: column - area.x - 1,
         });
     }
@@ -136,6 +140,23 @@ mod tests {
                 pane: PaneId::Editor,
                 row: 0,
                 col: 0
+            })
+        );
+    }
+
+    #[test]
+    fn bottom_tab_row_is_chrome_and_content_coordinates_exclude_it() {
+        let layout = layout();
+        assert_eq!(
+            hit_test(layout, layout.bottom.x + 2, layout.bottom.y + 1),
+            Some(MouseTarget::ShellTabStrip)
+        );
+        assert_eq!(
+            hit_test(layout, layout.bottom.x + 2, layout.bottom.y + 2),
+            Some(MouseTarget::Content {
+                pane: PaneId::Bottom,
+                row: 0,
+                col: 1
             })
         );
     }

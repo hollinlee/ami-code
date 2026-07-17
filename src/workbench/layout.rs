@@ -3,6 +3,8 @@ use ratatui::layout::Rect;
 /// A bordered terminal needs one content cell in each direction.
 pub const MIN_TERMINAL_WIDTH: u16 = 4;
 pub const MIN_TERMINAL_HEIGHT: u16 = 4;
+/// Bordered Shell plus one tab-strip row and two parser-safe content rows.
+pub const MIN_SHELL_PANE_HEIGHT: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkbenchLayoutConfig {
@@ -96,10 +98,13 @@ impl WorkbenchLayout {
         let agent_width = main_width - editor_width;
         let main_x = area.x.saturating_add(sidebar_width);
 
-        let bottom_height = if visibility.bottom {
-            config
-                .bottom_height
-                .min(area.height.saturating_sub(MIN_TERMINAL_HEIGHT))
+        let bottom_height = if visibility.bottom
+            && area.height >= MIN_TERMINAL_HEIGHT.saturating_add(MIN_SHELL_PANE_HEIGHT)
+        {
+            config.bottom_height.clamp(
+                MIN_SHELL_PANE_HEIGHT,
+                area.height.saturating_sub(MIN_TERMINAL_HEIGHT),
+            )
         } else {
             0
         };
@@ -118,7 +123,7 @@ impl WorkbenchLayout {
                 agent_width,
                 area.height,
             ),
-            bottom: if visibility.bottom && bottom_height >= MIN_TERMINAL_HEIGHT {
+            bottom: if visibility.bottom && bottom_height >= MIN_SHELL_PANE_HEIGHT {
                 Rect::new(
                     main_x,
                     area.y.saturating_add(editor_height),
@@ -180,11 +185,15 @@ mod tests {
                         assert!(pane.right() <= area.right());
                         assert!(pane.bottom() <= area.bottom());
                     }
-                    for pane in [layout.editor, layout.agent, layout.bottom] {
+                    for pane in [layout.editor, layout.agent] {
                         if pane.width != 0 || pane.height != 0 {
                             assert!(pane.width >= MIN_TERMINAL_WIDTH);
                             assert!(pane.height >= MIN_TERMINAL_HEIGHT);
                         }
+                    }
+                    if layout.bottom.width != 0 || layout.bottom.height != 0 {
+                        assert!(layout.bottom.width >= MIN_TERMINAL_WIDTH);
+                        assert!(layout.bottom.height >= MIN_SHELL_PANE_HEIGHT);
                     }
                 }
             }
@@ -199,6 +208,34 @@ mod tests {
         };
         let layout = WorkbenchLayout::calculate(Rect::new(0, 0, 160, 40), config);
         assert_eq!((layout.editor.width, layout.agent.width), (77, 59));
+    }
+
+    #[test]
+    fn shell_tab_row_requires_five_pane_rows() {
+        let config = WorkbenchLayoutConfig {
+            bottom_height: MIN_SHELL_PANE_HEIGHT,
+            ..WorkbenchLayoutConfig::default()
+        };
+        let hidden = WorkbenchLayout::calculate_visible(
+            Rect::new(0, 0, 120, 8),
+            config,
+            WorkbenchVisibility {
+                sidebar: false,
+                bottom: true,
+            },
+        );
+        assert_eq!(hidden.bottom, Rect::default());
+
+        let visible = WorkbenchLayout::calculate_visible(
+            Rect::new(0, 0, 120, 9),
+            config,
+            WorkbenchVisibility {
+                sidebar: false,
+                bottom: true,
+            },
+        );
+        assert_eq!(visible.editor.height, MIN_TERMINAL_HEIGHT);
+        assert_eq!(visible.bottom.height, MIN_SHELL_PANE_HEIGHT);
     }
 
     #[test]

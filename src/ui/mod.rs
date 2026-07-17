@@ -8,8 +8,9 @@ use ratatui::widgets::Paragraph;
 
 pub use sidebar::{SidebarStyle, render_sidebar};
 pub use terminal::{
-    TerminalPaneStyle, render_compact_workbench, render_terminal_pane,
-    render_unavailable_terminal_pane, terminal_content_size,
+    ShellTerminalPaneView, TerminalPaneStyle, render_compact_workbench, render_shell_terminal_pane,
+    render_terminal_pane, render_unavailable_terminal_pane, shell_terminal_content_size,
+    terminal_content_size,
 };
 
 /// Paint compact, familiar restore/collapse affordances over pane borders.

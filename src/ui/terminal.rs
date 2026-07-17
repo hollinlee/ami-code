@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::{TerminalPoint, TerminalRange, TerminalSize};
+use crate::workbench::{ShellTabs, shell_tab_geometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalPaneStyle {
@@ -22,6 +23,10 @@ impl Default for TerminalPaneStyle {
 
 pub fn terminal_content_size(area: Rect) -> TerminalSize {
     TerminalSize::new(area.width.saturating_sub(2), area.height.saturating_sub(2))
+}
+
+pub fn shell_terminal_content_size(area: Rect) -> TerminalSize {
+    TerminalSize::new(area.width.saturating_sub(2), area.height.saturating_sub(3))
 }
 
 pub fn render_compact_workbench(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -56,6 +61,93 @@ pub fn render_unavailable_terminal_pane(
             .block(block),
         area,
     );
+}
+
+pub struct ShellTerminalPaneView<'a> {
+    pub screen: Option<&'a vt100::Screen>,
+    pub title: &'a str,
+    pub message: Option<&'a str>,
+    pub focused: bool,
+    pub selection: Option<TerminalRange>,
+    pub tabs: &'a ShellTabs,
+    pub style: TerminalPaneStyle,
+}
+
+pub fn render_shell_terminal_pane(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    view: ShellTerminalPaneView<'_>,
+) {
+    let block = Block::default()
+        .title(view.title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if view.focused {
+            view.style.focused_border
+        } else {
+            view.style.unfocused_border
+        }));
+    frame.render_widget(block, area);
+
+    let (geometry, plus) = shell_tab_geometry(area, view.tabs);
+    for tab in geometry {
+        let active = tab.id == view.tabs.active();
+        let label = tab_label(tab.display_number, tab.width, active);
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(
+            Paragraph::new(label).style(style),
+            Rect::new(tab.x, area.y + 1, tab.width, 1),
+        );
+    }
+    if let Some((x, y)) = plus {
+        frame.render_widget(
+            Paragraph::new("+").style(Style::default().fg(Color::LightGreen)),
+            Rect::new(x, y, 1, 1),
+        );
+    }
+
+    let content = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(3),
+    );
+    if let Some(screen) = view.screen {
+        frame.render_widget(
+            Paragraph::new(styled_screen_lines(screen, view.selection)),
+            content,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(view.message.unwrap_or("unavailable"))
+                .style(Style::default().fg(Color::Yellow)),
+            content,
+        );
+    }
+}
+
+fn tab_label(display_number: usize, width: u16, active: bool) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let marker = if active { "●" } else { " " };
+    let body_width = usize::from(width - 1);
+    let mut chars: String = format!("{marker}{display_number}")
+        .chars()
+        .take(body_width)
+        .collect();
+    while chars.chars().count() < body_width {
+        chars.push(' ');
+    }
+    // Geometry assigns exactly the final cell to close.
+    chars.push('×');
+    chars
 }
 
 pub fn render_terminal_pane(
@@ -217,6 +309,25 @@ mod tests {
             terminal_content_size(Rect::new(0, 0, 1, 1)),
             TerminalSize::new(2, 2)
         );
+        assert_eq!(
+            shell_terminal_content_size(Rect::new(0, 0, 120, 30)),
+            TerminalSize::new(118, 27)
+        );
+        assert_eq!(
+            shell_terminal_content_size(Rect::new(0, 0, 20, 5)),
+            TerminalSize::new(18, 2)
+        );
+    }
+
+    #[test]
+    fn shell_tab_label_has_exactly_one_close_cell() {
+        let label = tab_label(1, 7, true);
+        assert_eq!(label, "●1    ×");
+        assert_eq!(
+            label.chars().filter(|character| *character == '×').count(),
+            1
+        );
+        assert_eq!(label.chars().count(), 7);
     }
 
     #[test]

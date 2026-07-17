@@ -20,12 +20,14 @@ use super::supervisor::{RestartDecision, RestartPolicy, SessionIdentity, Session
 use crate::backend::{BackendKind, BackendSpec, NvimBackend, PiBackend, ShellBackend};
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
-    SidebarStyle, TerminalPaneStyle, render_compact_workbench, render_layout_controls,
-    render_sidebar, render_terminal_pane, render_unavailable_terminal_pane, terminal_content_size,
+    ShellTerminalPaneView, SidebarStyle, TerminalPaneStyle, render_compact_workbench,
+    render_layout_controls, render_shell_terminal_pane, render_sidebar, render_terminal_pane,
+    render_unavailable_terminal_pane, shell_terminal_content_size, terminal_content_size,
 };
 use crate::workbench::{
-    LayoutDivider, LayoutHandle, LayoutStore, MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, MouseTarget,
-    PaneId, WorkbenchLayout, WorkbenchLayoutConfig, WorkbenchState, hit_test,
+    LayoutDivider, LayoutHandle, LayoutStore, MIN_SHELL_PANE_HEIGHT, MIN_TERMINAL_HEIGHT,
+    MIN_TERMINAL_WIDTH, MouseTarget, PaneId, ShellTabId, ShellTabTarget, WorkbenchLayout,
+    WorkbenchLayoutConfig, WorkbenchState, hit_test, shell_tab_hit_test,
 };
 use crate::workspace::Workspace;
 
@@ -113,9 +115,16 @@ struct SessionSlot {
     state: SlotState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SessionKey {
+    Pane(PaneId),
+    Shell(ShellTabId),
+}
+
 struct SessionRegistry {
-    slots: HashMap<PaneId, SessionSlot>,
+    slots: HashMap<SessionKey, SessionSlot>,
     ids: SessionIds,
+    shell_spec: Option<ProcessSpec>,
 }
 
 impl SessionRegistry {
@@ -130,46 +139,56 @@ impl SessionRegistry {
             LaunchMode::Pi => checked_process_spec(PiBackend, BackendKind::Agent, workspace),
             LaunchMode::Workbench => unreachable!("workbench uses multiple slots"),
         };
-        Self::from_slots([(PaneId::Editor, spec, terminal_content_size(area))], now)
-    }
-
-    fn workbench(workspace: &Workspace, layout: WorkbenchLayout, now: Instant) -> Self {
         Self::from_slots(
-            [
-                (
-                    PaneId::Editor,
-                    checked_process_spec(NvimBackend, BackendKind::Editor, workspace),
-                    terminal_content_size(layout.editor),
-                ),
-                (
-                    PaneId::Agent,
-                    checked_process_spec(PiBackend, BackendKind::Agent, workspace),
-                    terminal_content_size(layout.agent),
-                ),
-                (
-                    PaneId::Bottom,
-                    checked_process_spec(
-                        ShellBackend::system_default(),
-                        BackendKind::Shell,
-                        workspace,
-                    ),
-                    terminal_content_size(layout.bottom),
-                ),
-            ],
+            [(
+                SessionKey::Pane(PaneId::Editor),
+                spec,
+                terminal_content_size(area),
+            )],
             now,
         )
     }
 
+    fn workbench(workspace: &Workspace, layout: WorkbenchLayout, now: Instant) -> Self {
+        let shell_spec = checked_process_spec(
+            ShellBackend::system_default(),
+            BackendKind::Shell,
+            workspace,
+        );
+        let mut registry = Self::from_slots(
+            [
+                (
+                    SessionKey::Pane(PaneId::Editor),
+                    checked_process_spec(NvimBackend, BackendKind::Editor, workspace),
+                    terminal_content_size(layout.editor),
+                ),
+                (
+                    SessionKey::Pane(PaneId::Agent),
+                    checked_process_spec(PiBackend, BackendKind::Agent, workspace),
+                    terminal_content_size(layout.agent),
+                ),
+                (
+                    SessionKey::Shell(ShellTabId(1)),
+                    shell_spec.clone(),
+                    shell_terminal_content_size(layout.bottom),
+                ),
+            ],
+            now,
+        );
+        registry.shell_spec = Some(shell_spec);
+        registry
+    }
+
     fn from_slots<const N: usize>(
-        slots: [(PaneId, ProcessSpec, TerminalSize); N],
+        slots: [(SessionKey, ProcessSpec, TerminalSize); N],
         now: Instant,
     ) -> Self {
         let mut registry = Self {
             slots: slots
                 .into_iter()
-                .map(|(pane, spec, size)| {
+                .map(|(key, spec, size)| {
                     (
-                        pane,
+                        key,
                         SessionSlot {
                             spec,
                             size,
@@ -181,31 +200,32 @@ impl SessionRegistry {
                 })
                 .collect(),
             ids: SessionIds::new(),
+            shell_spec: None,
         };
-        let panes: Vec<_> = registry.slots.keys().copied().collect();
-        for pane in panes {
-            registry.spawn(pane, now);
+        let keys: Vec<_> = registry.slots.keys().copied().collect();
+        for key in keys {
+            registry.spawn(key, now);
         }
         registry
     }
 
-    fn get(&self, pane: &PaneId) -> Option<&TerminalSession> {
-        match &self.slots.get(pane)?.state {
+    fn get(&self, key: &SessionKey) -> Option<&TerminalSession> {
+        match &self.slots.get(key)?.state {
             SlotState::Running { session, .. } => Some(session),
             _ => None,
         }
     }
 
-    fn get_mut(&mut self, pane: &PaneId) -> Option<&mut TerminalSession> {
-        match &mut self.slots.get_mut(pane)?.state {
+    fn get_mut(&mut self, key: &SessionKey) -> Option<&mut TerminalSession> {
+        match &mut self.slots.get_mut(key)?.state {
             SlotState::Running { session, .. } => Some(session),
             _ => None,
         }
     }
 
-    fn resize_slot(&mut self, pane: PaneId, size: TerminalSize, now: Instant) -> Result<()> {
+    fn resize_slot(&mut self, key: SessionKey, size: TerminalSize, now: Instant) -> Result<()> {
         let failure = {
-            let Some(slot) = self.slots.get_mut(&pane) else {
+            let Some(slot) = self.slots.get_mut(&key) else {
                 return Ok(());
             };
             slot.size = size;
@@ -220,14 +240,14 @@ impl SessionRegistry {
             }
         };
         if let Some((identity, message)) = failure {
-            self.handle_failure(pane, identity, now, message)?;
+            self.handle_failure(key, identity, now, message)?;
         }
         Ok(())
     }
 
-    fn send_key(&mut self, pane: PaneId, key: KeyEvent, now: Instant) -> Result<bool> {
+    fn send_key(&mut self, slot_key: SessionKey, key: KeyEvent, now: Instant) -> Result<bool> {
         let event = {
-            let Some(slot) = self.slots.get_mut(&pane) else {
+            let Some(slot) = self.slots.get_mut(&slot_key) else {
                 return Ok(false);
             };
             match &mut slot.state {
@@ -242,7 +262,7 @@ impl SessionRegistry {
         };
         if let Err(error) = result {
             self.handle_failure(
-                pane,
+                slot_key,
                 identity,
                 now,
                 format!("backend input error: {error:#}"),
@@ -251,9 +271,9 @@ impl SessionRegistry {
         Ok(true)
     }
 
-    fn send_mouse(&mut self, pane: PaneId, event: MouseEvent, now: Instant) -> Result<bool> {
+    fn send_mouse(&mut self, key: SessionKey, event: MouseEvent, now: Instant) -> Result<bool> {
         let result = {
-            let Some(slot) = self.slots.get_mut(&pane) else {
+            let Some(slot) = self.slots.get_mut(&key) else {
                 return Ok(false);
             };
             match &mut slot.state {
@@ -268,7 +288,7 @@ impl SessionRegistry {
         };
         if let Err(error) = result {
             self.handle_failure(
-                pane,
+                key,
                 identity,
                 now,
                 format!("backend mouse error: {error:#}"),
@@ -277,9 +297,14 @@ impl SessionRegistry {
         Ok(true)
     }
 
-    fn send_paste(&mut self, pane: PaneId, contents: &str, now: Instant) -> Result<PasteDelivery> {
+    fn send_paste(
+        &mut self,
+        key: SessionKey,
+        contents: &str,
+        now: Instant,
+    ) -> Result<PasteDelivery> {
         let result = {
-            let Some(slot) = self.slots.get_mut(&pane) else {
+            let Some(slot) = self.slots.get_mut(&key) else {
                 return Ok(PasteDelivery::Unavailable);
             };
             match &mut slot.state {
@@ -299,7 +324,7 @@ impl SessionRegistry {
             )),
             Err(PasteError::Write(error)) => {
                 self.handle_failure(
-                    pane,
+                    key,
                     identity,
                     now,
                     format!("backend paste error: {error:#}"),
@@ -309,8 +334,8 @@ impl SessionRegistry {
         }
     }
 
-    fn status(&self, pane: PaneId, now: Instant, click_retry: bool) -> Option<String> {
-        let slot = self.slots.get(&pane)?;
+    fn status(&self, key: SessionKey, now: Instant, click_retry: bool) -> Option<String> {
+        let slot = self.slots.get(&key)?;
         match &slot.state {
             SlotState::Running { .. } => None,
             SlotState::Starting => Some("starting…".to_string()),
@@ -325,21 +350,29 @@ impl SessionRegistry {
         }
     }
 
-    fn poll(&mut self, now: Instant) -> Result<()> {
+    fn poll(&mut self, now: Instant) -> Result<Vec<ShellTabId>> {
         if self.ids.is_shutting_down() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let panes: Vec<_> = self.slots.keys().copied().collect();
-        for pane in panes.iter().copied() {
+        let mut exited_shells = Vec::new();
+        let keys: Vec<_> = self.slots.keys().copied().collect();
+        for key in keys.iter().copied() {
             let event = {
-                let slot = self.slots.get_mut(&pane).expect("known session slot");
+                let slot = self.slots.get_mut(&key).expect("known session slot");
                 match &mut slot.state {
                     SlotState::Running {
                         identity, session, ..
                     } => {
                         let identity = *identity;
                         match session.poll_output().and_then(|()| session.has_exited()) {
-                            Ok(true) => Some((identity, "backend exited".to_string())),
+                            Ok(true) => {
+                                if let SessionKey::Shell(id) = key {
+                                    exited_shells.push(id);
+                                    None
+                                } else {
+                                    Some((identity, "backend exited".to_string()))
+                                }
+                            }
                             Ok(false) => None,
                             Err(error) => Some((identity, format!("backend error: {error:#}"))),
                         }
@@ -348,23 +381,65 @@ impl SessionRegistry {
                 }
             };
             if let Some((identity, message)) = event {
-                self.handle_failure(pane, identity, now, message)?;
+                self.handle_failure(key, identity, now, message)?;
             }
         }
-        for pane in panes {
-            let due = self.slots.get(&pane).is_some_and(
+        for key in keys {
+            let due = self.slots.get(&key).is_some_and(
                 |slot| matches!(slot.state, SlotState::Backoff { until, .. } if now >= until),
             );
             if due {
-                self.spawn(pane, now);
+                self.spawn(key, now);
             }
         }
+        Ok(exited_shells)
+    }
+
+    fn add_shell(&mut self, id: ShellTabId, size: TerminalSize, now: Instant) -> Result<()> {
+        let spec = self
+            .shell_spec
+            .clone()
+            .context("shell tab registry is missing its process spec")?;
+        self.slots.insert(
+            SessionKey::Shell(id),
+            SessionSlot {
+                spec,
+                size,
+                generation: 0,
+                policy: RestartPolicy::default(),
+                state: SlotState::Starting,
+            },
+        );
+        self.spawn(SessionKey::Shell(id), now);
         Ok(())
+    }
+
+    fn close_shell(&mut self, id: ShellTabId, replacement: Option<ShellTabId>, now: Instant) {
+        let key = SessionKey::Shell(id);
+        let Some(mut removed) = self.slots.remove(&key) else {
+            return;
+        };
+        if let SlotState::Running { session, .. } = &mut removed.state {
+            session.terminate();
+        }
+        if let Some(replacement) = replacement {
+            self.slots.insert(
+                SessionKey::Shell(replacement),
+                SessionSlot {
+                    spec: removed.spec,
+                    size: removed.size,
+                    generation: 0,
+                    policy: RestartPolicy::default(),
+                    state: SlotState::Starting,
+                },
+            );
+            self.spawn(SessionKey::Shell(replacement), now);
+        }
     }
 
     fn handle_failure(
         &mut self,
-        pane: PaneId,
+        key: SessionKey,
         identity: SessionIdentity,
         now: Instant,
         message: String,
@@ -374,7 +449,7 @@ impl SessionRegistry {
         }
         let slot = self
             .slots
-            .get_mut(&pane)
+            .get_mut(&key)
             .context("lifecycle event for unknown session slot")?;
         let (current_identity, started_at) = match &slot.state {
             SlotState::Running {
@@ -403,11 +478,11 @@ impl SessionRegistry {
         Ok(())
     }
 
-    fn spawn(&mut self, pane: PaneId, now: Instant) {
+    fn spawn(&mut self, key: SessionKey, now: Instant) {
         if self.ids.is_shutting_down() {
             return;
         }
-        let Some(slot) = self.slots.get_mut(&pane) else {
+        let Some(slot) = self.slots.get_mut(&key) else {
             return;
         };
         slot.generation = slot
@@ -438,18 +513,18 @@ impl SessionRegistry {
         }
     }
 
-    fn retry(&mut self, pane: PaneId, now: Instant) {
-        if self.ids.is_shutting_down() || !self.slots.contains_key(&pane) {
+    fn retry(&mut self, key: SessionKey, now: Instant) {
+        if self.ids.is_shutting_down() || !self.slots.contains_key(&key) {
             return;
         }
-        if let Some(slot) = self.slots.get_mut(&pane) {
+        if let Some(slot) = self.slots.get_mut(&key) {
             if matches!(slot.state, SlotState::Running { .. }) {
                 return;
             }
             slot.policy.reset();
             slot.state = SlotState::Starting;
         }
-        self.spawn(pane, now);
+        self.spawn(key, now);
     }
 
     fn shutdown(&mut self) {
@@ -544,7 +619,27 @@ impl AppRuntime {
     }
 
     fn poll_sessions_at(&mut self, now: Instant) -> Result<()> {
-        self.sessions.poll(now)
+        let exited = self.sessions.poll(now)?;
+        for id in exited {
+            self.close_shell_tab(id, now);
+        }
+        Ok(())
+    }
+
+    fn close_shell_tab(&mut self, id: ShellTabId, now: Instant) {
+        if self.workbench.shell_tabs().active() == id
+            && self
+                .workbench
+                .selection()
+                .is_some_and(|selection| selection.pane() == PaneId::Bottom)
+        {
+            // Reset the active session's frozen selection screen before the tab
+            // reducer changes identity or the registry removes its process.
+            self.clear_selection();
+        }
+        if let Some((removed, replacement)) = self.workbench.shell_tabs_mut().close(id) {
+            self.sessions.close_shell(removed, replacement, now);
+        }
     }
 
     fn shutdown(&mut self) {
@@ -584,18 +679,32 @@ impl AppRuntime {
             for (pane, pane_area) in [
                 (PaneId::Editor, layout.editor),
                 (PaneId::Agent, layout.agent),
-                (PaneId::Bottom, layout.bottom),
             ] {
                 if pane_area.width >= MIN_TERMINAL_WIDTH && pane_area.height >= MIN_TERMINAL_HEIGHT
                 {
+                    self.sessions.resize_slot(
+                        SessionKey::Pane(pane),
+                        terminal_content_size(pane_area),
+                        now,
+                    )?;
+                }
+            }
+            if layout.bottom.width >= MIN_TERMINAL_WIDTH
+                && layout.bottom.height >= MIN_SHELL_PANE_HEIGHT
+            {
+                let size = shell_terminal_content_size(layout.bottom);
+                for id in self.workbench.shell_tabs().ids().collect::<Vec<_>>() {
                     self.sessions
-                        .resize_slot(pane, terminal_content_size(pane_area), now)?;
+                        .resize_slot(SessionKey::Shell(id), size, now)?;
                 }
             }
             self.layout = Some(layout);
         } else {
-            self.sessions
-                .resize_slot(PaneId::Editor, terminal_content_size(area), now)?;
+            self.sessions.resize_slot(
+                SessionKey::Pane(PaneId::Editor),
+                terminal_content_size(area),
+                now,
+            )?;
         }
         Ok(())
     }
@@ -636,7 +745,12 @@ impl AppRuntime {
             (PaneId::Agent, layout.agent),
             (PaneId::Bottom, layout.bottom),
         ] {
-            if area.width >= MIN_TERMINAL_WIDTH && area.height >= MIN_TERMINAL_HEIGHT {
+            let minimum_height = if pane == PaneId::Bottom {
+                MIN_SHELL_PANE_HEIGHT
+            } else {
+                MIN_TERMINAL_HEIGHT
+            };
+            if area.width >= MIN_TERMINAL_WIDTH && area.height >= minimum_height {
                 self.render_slot(
                     frame,
                     pane,
@@ -660,7 +774,28 @@ impl AppRuntime {
         let title_handle = self.launch_mode.is_workbench()
             && pane == PaneId::Bottom
             && self.layout.is_some_and(|layout| layout.bottom.height > 0);
-        if let Some(session) = self.sessions.get(&pane) {
+        if self.launch_mode.is_workbench() && pane == PaneId::Bottom {
+            let key = session_key(&self.workbench, pane);
+            let session = self.sessions.get(&key);
+            let status = self.sessions.status(key, Instant::now(), true);
+            let title =
+                session_title_with_handle("shell", status.as_deref(), area.width, title_handle);
+            render_shell_terminal_pane(
+                frame,
+                area,
+                ShellTerminalPaneView {
+                    screen: session.map(TerminalSession::screen),
+                    title: &title,
+                    message: status.as_deref(),
+                    focused,
+                    selection,
+                    tabs: self.workbench.shell_tabs(),
+                    style: TerminalPaneStyle::default(),
+                },
+            );
+            return;
+        }
+        if let Some(session) = self.sessions.get(&session_key(&self.workbench, pane)) {
             render_session(
                 frame,
                 area,
@@ -674,12 +809,16 @@ impl AppRuntime {
         }
         let status = self
             .sessions
-            .status(pane, Instant::now(), self.launch_mode.is_workbench())
+            .status(
+                session_key(&self.workbench, pane),
+                Instant::now(),
+                self.launch_mode.is_workbench(),
+            )
             .unwrap_or_else(|| "unavailable".to_string());
         let display_name = self
             .sessions
             .slots
-            .get(&pane)
+            .get(&session_key(&self.workbench, pane))
             .map(|slot| slot.spec.display_name.as_str())
             .unwrap_or("backend");
         let title =
@@ -720,8 +859,11 @@ impl AppRuntime {
                     PaneId::Editor
                 };
                 let now = Instant::now();
-                if !self.sessions.send_key(pane, key, now)? {
-                    self.sessions.retry(pane, now);
+                if !self
+                    .sessions
+                    .send_key(session_key(&self.workbench, pane), key, now)?
+                {
+                    self.sessions.retry(session_key(&self.workbench, pane), now);
                 }
             }
             Event::Paste(contents) => {
@@ -743,7 +885,10 @@ impl AppRuntime {
         let Some(selection) = self.workbench.selection() else {
             return;
         };
-        let Some(session) = self.sessions.get(&selection.pane()) else {
+        let Some(session) = self
+            .sessions
+            .get(&session_key(&self.workbench, selection.pane()))
+        else {
             self.set_status("selected pane is unavailable");
             return;
         };
@@ -756,7 +901,9 @@ impl AppRuntime {
 
     fn clear_selection(&mut self) {
         if let Some(selection) = self.workbench.selection()
-            && let Some(session) = self.sessions.get_mut(&selection.pane())
+            && let Some(session) = self
+                .sessions
+                .get_mut(&session_key(&self.workbench, selection.pane()))
         {
             session.reset_scrollback();
         }
@@ -767,6 +914,39 @@ impl AppRuntime {
         let Some(layout) = self.layout else {
             return Ok(());
         };
+        // The complete tab row is frontend chrome. Consume even overflow/blank
+        // cells so no gesture can focus, select, paste into, or reach a PTY.
+        if layout.bottom.height > 0
+            && event.row == layout.bottom.y.saturating_add(1)
+            && event.column > layout.bottom.x
+            && event.column < layout.bottom.right().saturating_sub(1)
+        {
+            self.pending_mouse = None;
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.workbench.focus_pane(PaneId::Bottom);
+                match shell_tab_hit_test(
+                    layout.bottom,
+                    self.workbench.shell_tabs(),
+                    event.column,
+                    event.row,
+                ) {
+                    Some(ShellTabTarget::Body(id)) => {
+                        if self.workbench.shell_tabs().active() != id {
+                            self.clear_selection();
+                            self.workbench.shell_tabs_mut().select(id);
+                        }
+                    }
+                    Some(ShellTabTarget::Close(id)) => self.close_shell_tab(id, Instant::now()),
+                    Some(ShellTabTarget::Plus) => {
+                        let id = self.workbench.shell_tabs_mut().new_tab();
+                        let size = shell_terminal_content_size(layout.bottom);
+                        self.sessions.add_shell(id, size, Instant::now())?;
+                    }
+                    None => {}
+                }
+            }
+            return Ok(());
+        }
         let target = hit_test(layout, event.column, event.row);
 
         match event.kind {
@@ -890,7 +1070,7 @@ impl AppRuntime {
         let MouseTarget::Content { pane, row, col } = target else {
             return false;
         };
-        let Some(session) = self.sessions.get_mut(&pane) else {
+        let Some(session) = self.sessions.get_mut(&session_key(&self.workbench, pane)) else {
             return false;
         };
         session.begin_selection_view();
@@ -911,7 +1091,7 @@ impl AppRuntime {
         let Some((row, col)) = pointer_content_position(layout, pane, event) else {
             return;
         };
-        let Some(session) = self.sessions.get(&pane) else {
+        let Some(session) = self.sessions.get(&session_key(&self.workbench, pane)) else {
             return;
         };
         self.workbench
@@ -940,7 +1120,7 @@ impl AppRuntime {
         if direction == 0 {
             return;
         }
-        let Some(session) = self.sessions.get_mut(&pane) else {
+        let Some(session) = self.sessions.get_mut(&session_key(&self.workbench, pane)) else {
             return;
         };
         if !session.scroll_viewport(direction * EDGE_SCROLL_LINES) {
@@ -961,8 +1141,13 @@ impl AppRuntime {
         let MouseTarget::Content { pane, row, col } = pending.target else {
             return Ok(());
         };
-        if self.sessions.get(&pane).is_none() {
-            self.sessions.retry(pane, Instant::now());
+        if self
+            .sessions
+            .get(&session_key(&self.workbench, pane))
+            .is_none()
+        {
+            self.sessions
+                .retry(session_key(&self.workbench, pane), Instant::now());
             return Ok(());
         }
         let (release_row, release_col) = self
@@ -970,10 +1155,16 @@ impl AppRuntime {
             .and_then(|layout| pointer_content_position(layout, pane, release))
             .unwrap_or((row, col));
         let now = Instant::now();
-        self.sessions
-            .send_mouse(pane, mouse_at(pending.down, row, col), now)?;
-        self.sessions
-            .send_mouse(pane, mouse_at(release, release_row, release_col), now)?;
+        self.sessions.send_mouse(
+            session_key(&self.workbench, pane),
+            mouse_at(pending.down, row, col),
+            now,
+        )?;
+        self.sessions.send_mouse(
+            session_key(&self.workbench, pane),
+            mouse_at(release, release_row, release_col),
+            now,
+        )?;
         Ok(())
     }
 
@@ -985,8 +1176,11 @@ impl AppRuntime {
         let Some(MouseTarget::Content { pane, row, col }) = target else {
             return Ok(());
         };
-        self.sessions
-            .send_mouse(pane, mouse_at(event, row, col), Instant::now())?;
+        self.sessions.send_mouse(
+            session_key(&self.workbench, pane),
+            mouse_at(event, row, col),
+            Instant::now(),
+        )?;
         Ok(())
     }
 
@@ -998,7 +1192,7 @@ impl AppRuntime {
             .workbench
             .selection()
             .is_some_and(|selection| selection.pane() == pane);
-        let Some(session) = self.sessions.get_mut(&pane) else {
+        let Some(session) = self.sessions.get_mut(&session_key(&self.workbench, pane)) else {
             return Ok(());
         };
         let lines = match event.kind {
@@ -1011,8 +1205,11 @@ impl AppRuntime {
         if selection_owns_wheel && lines != 0 {
             session.scroll_viewport(lines);
         } else if session.mouse_reporting() {
-            self.sessions
-                .send_mouse(pane, mouse_at(event, row, col), Instant::now())?;
+            self.sessions.send_mouse(
+                session_key(&self.workbench, pane),
+                mouse_at(event, row, col),
+                Instant::now(),
+            )?;
         } else if lines != 0 {
             session.scroll_viewport(lines);
         }
@@ -1033,7 +1230,11 @@ impl AppRuntime {
         } else {
             PaneId::Editor
         };
-        match self.sessions.send_paste(pane, contents, Instant::now())? {
+        match self.sessions.send_paste(
+            session_key(&self.workbench, pane),
+            contents,
+            Instant::now(),
+        )? {
             PasteDelivery::Sent => self.status = None,
             PasteDelivery::Unavailable => {
                 self.set_status("focused pane does not accept paste");
@@ -1169,7 +1370,7 @@ fn layout_drag_config(
                 .saturating_add(layout.bottom.height)
                 .saturating_sub(MIN_TERMINAL_HEIGHT);
             next.bottom_height =
-                offset_clamped(config.bottom_height, -dy, MIN_TERMINAL_HEIGHT, max);
+                offset_clamped(config.bottom_height, -dy, MIN_SHELL_PANE_HEIGHT, max);
         }
     }
     next
@@ -1183,6 +1384,14 @@ fn mouse_at(mut event: MouseEvent, row: u16, col: u16) -> MouseEvent {
     event.row = row;
     event.column = col;
     event
+}
+
+fn session_key(workbench: &WorkbenchState, pane: PaneId) -> SessionKey {
+    if pane == PaneId::Bottom {
+        SessionKey::Shell(workbench.shell_tabs().active())
+    } else {
+        SessionKey::Pane(pane)
+    }
 }
 
 fn pane_area(layout: WorkbenchLayout, pane: PaneId) -> Option<Rect> {
@@ -1200,10 +1409,15 @@ fn pointer_content_position(
     event: MouseEvent,
 ) -> Option<(u16, u16)> {
     let area = pane_area(layout, pane)?;
-    let size = terminal_content_size(area);
+    let bottom = pane == PaneId::Bottom;
+    let size = if bottom {
+        shell_terminal_content_size(area)
+    } else {
+        terminal_content_size(area)
+    };
     let row = event
         .row
-        .saturating_sub(area.y.saturating_add(1))
+        .saturating_sub(area.y.saturating_add(if bottom { 2 } else { 1 }))
         .min(size.rows.saturating_sub(1));
     let col = event
         .column
@@ -1216,7 +1430,9 @@ fn edge_scroll_direction(layout: WorkbenchLayout, pane: PaneId, event: MouseEven
     let Some(area) = pane_area(layout, pane) else {
         return 0;
     };
-    let content_top = area.y.saturating_add(1);
+    let content_top = area
+        .y
+        .saturating_add(if pane == PaneId::Bottom { 2 } else { 1 });
     let content_bottom = area.bottom().saturating_sub(2);
     if event.row <= content_top {
         1
@@ -1374,13 +1590,13 @@ mod tests {
         let now = Instant::now();
         let mut registry = SessionRegistry::from_slots(
             [(
-                PaneId::Editor,
+                SessionKey::Pane(PaneId::Editor),
                 sleeping_shell_spec(),
                 TerminalSize::new(20, 5),
             )],
             now,
         );
-        let current = match &registry.slots[&PaneId::Editor].state {
+        let current = match &registry.slots[&SessionKey::Pane(PaneId::Editor)].state {
             SlotState::Running { identity, .. } => *identity,
             _ => panic!("session did not start"),
         };
@@ -1390,11 +1606,16 @@ mod tests {
         };
 
         registry
-            .handle_failure(PaneId::Editor, stale, now, "stale exit".to_string())
+            .handle_failure(
+                SessionKey::Pane(PaneId::Editor),
+                stale,
+                now,
+                "stale exit".to_string(),
+            )
             .unwrap();
 
         assert!(matches!(
-            registry.slots[&PaneId::Editor].state,
+            registry.slots[&SessionKey::Pane(PaneId::Editor)].state,
             SlotState::Running { identity, .. } if identity == current
         ));
         registry.shutdown();
@@ -1405,18 +1626,21 @@ mod tests {
         let now = Instant::now();
         let mut registry = SessionRegistry::from_slots(
             [(
-                PaneId::Editor,
+                SessionKey::Pane(PaneId::Editor),
                 sleeping_shell_spec(),
                 TerminalSize::new(20, 5),
             )],
             now,
         );
         registry.shutdown();
-        registry.retry(PaneId::Editor, now + Duration::from_secs(1));
+        registry.retry(
+            SessionKey::Pane(PaneId::Editor),
+            now + Duration::from_secs(1),
+        );
         registry.poll(now + Duration::from_secs(60)).unwrap();
 
         assert!(matches!(
-            registry.slots[&PaneId::Editor].state,
+            registry.slots[&SessionKey::Pane(PaneId::Editor)].state,
             SlotState::Paused { .. }
         ));
     }
@@ -1519,7 +1743,7 @@ mod tests {
         );
         let bottom_layout = WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), bottom);
         assert!(bottom_layout.editor.height >= MIN_TERMINAL_HEIGHT);
-        assert!(bottom_layout.bottom.height >= MIN_TERMINAL_HEIGHT);
+        assert!(bottom_layout.bottom.height >= MIN_SHELL_PANE_HEIGHT);
     }
 
     #[test]
@@ -1571,6 +1795,67 @@ mod tests {
         });
         assert_eq!(canceled_layout_config(&mut handle), None);
         assert!(handle.is_none());
+    }
+
+    #[test]
+    fn bottom_terminal_coordinates_skip_tab_chrome() {
+        let layout =
+            WorkbenchLayout::calculate(Rect::new(0, 0, 120, 40), WorkbenchLayoutConfig::default());
+        let event = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: layout.bottom.x + 3,
+            row: layout.bottom.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            pointer_content_position(layout, PaneId::Bottom, event),
+            Some((0, 2))
+        );
+        assert_eq!(edge_scroll_direction(layout, PaneId::Bottom, event), 1);
+    }
+
+    #[test]
+    fn registry_keeps_independent_shell_slots_and_resizes_inactive_slot() {
+        let spec = sleeping_shell_spec();
+        let mut registry = SessionRegistry {
+            slots: [ShellTabId(1), ShellTabId(2)]
+                .into_iter()
+                .map(|id| {
+                    (
+                        SessionKey::Shell(id),
+                        SessionSlot {
+                            spec: spec.clone(),
+                            size: TerminalSize::new(10, 4),
+                            generation: 0,
+                            policy: RestartPolicy::default(),
+                            state: SlotState::Starting,
+                        },
+                    )
+                })
+                .collect(),
+            ids: SessionIds::new(),
+            shell_spec: Some(spec),
+        };
+        registry
+            .resize_slot(
+                SessionKey::Shell(ShellTabId(1)),
+                TerminalSize::new(40, 12),
+                Instant::now(),
+            )
+            .unwrap();
+        registry
+            .resize_slot(
+                SessionKey::Shell(ShellTabId(2)),
+                TerminalSize::new(40, 12),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            registry
+                .slots
+                .values()
+                .all(|slot| slot.size == TerminalSize::new(40, 12))
+        );
     }
 
     #[test]
