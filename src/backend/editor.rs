@@ -2,7 +2,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -250,20 +250,32 @@ impl NvimController {
     }
 
     fn execute(&self, spec: ProcessSpec) -> Result<(), NvimRemoteError> {
-        let cwd = spec.cwd.as_ref().ok_or_else(|| {
-            NvimRemoteError::InvalidPath(anyhow::anyhow!("Nvim controller has no workspace cwd"))
-        })?;
-        let mut command = Command::new(&spec.program);
-        command.args(&spec.args).current_dir(cwd);
-        for (key, value) in &spec.env {
-            command.env(key, value);
-        }
-        let status = command.status().map_err(NvimRemoteError::Command)?;
-        if !status.success() {
-            return Err(NvimRemoteError::RemoteFailure(status));
-        }
-        Ok(())
+        execute_remote_spec(spec)
     }
+}
+
+fn execute_remote_spec(spec: ProcessSpec) -> Result<(), NvimRemoteError> {
+    let cwd = spec.cwd.as_ref().ok_or_else(|| {
+        NvimRemoteError::InvalidPath(anyhow::anyhow!("Nvim controller has no workspace cwd"))
+    })?;
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(cwd)
+        // A one-shot `nvim --server --remote` detects inherited raw TTYs and
+        // enters/leaves the alternate screen, corrupting the parent ratatui
+        // display. It does not need interactive streams.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    let status = command.status().map_err(NvimRemoteError::Command)?;
+    if !status.success() {
+        return Err(NvimRemoteError::RemoteFailure(status));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -585,6 +597,18 @@ mod tests {
             controller.remote_open_spec(requested),
             Err(NvimRemoteError::NonUtf8Path(_))
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_does_not_inherit_parent_tty_streams() {
+        let root = temp("detached-remote");
+        fs::create_dir_all(&root).unwrap();
+        let mut spec = ProcessSpec::new("/bin/sh");
+        spec.args = vec!["-c".into(), "[ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]".into()];
+        spec.cwd = Some(root.clone());
+        execute_remote_spec(spec).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
