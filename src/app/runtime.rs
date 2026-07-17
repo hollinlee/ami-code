@@ -17,7 +17,10 @@ use ratatui::layout::Rect;
 
 use super::LaunchMode;
 use super::supervisor::{RestartDecision, RestartPolicy, SessionIdentity, SessionIds};
-use crate::backend::{BackendKind, BackendSpec, NvimBackend, PiBackend, ShellBackend};
+use crate::backend::{
+    BackendKind, BackendSpec, ManagedNvimGeneration, ManagedNvimProfile, NvimController, PiBackend,
+    ShellBackend,
+};
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
     ShellTerminalPaneView, SidebarStyle, TerminalPaneStyle, render_compact_workbench,
@@ -107,8 +110,61 @@ enum SlotState {
     },
 }
 
+enum ProcessSource {
+    Static(ProcessSpec),
+    ManagedNvim {
+        profile: ManagedNvimProfile,
+        workspace: Workspace,
+        current: Option<ManagedNvimGeneration>,
+        controller: NvimController,
+    },
+}
+
+impl ProcessSource {
+    fn display_name(&self) -> &str {
+        match self {
+            Self::Static(spec) => &spec.display_name,
+            Self::ManagedNvim { .. } => "nvim",
+        }
+    }
+
+    fn next_spec(&mut self) -> Result<ProcessSpec> {
+        match self {
+            Self::Static(spec) => Ok(spec.clone()),
+            Self::ManagedNvim {
+                profile,
+                workspace,
+                current,
+                controller,
+            } => {
+                // Dropping the replaced generation first removes its stale socket.
+                current.take();
+                controller.replace_endpoint(None);
+                let generation = profile.generation(workspace)?;
+                let spec = generation.process_spec().clone();
+                controller.replace_endpoint(Some(generation.endpoint().to_path_buf()));
+                *current = Some(generation);
+                Ok(spec)
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        if let Self::ManagedNvim {
+            current,
+            controller,
+            ..
+        } = self
+        {
+            current.take();
+            controller.replace_endpoint(None);
+        }
+    }
+}
+
 struct SessionSlot {
     spec: ProcessSpec,
+    source: ProcessSource,
     size: TerminalSize,
     generation: u64,
     policy: RestartPolicy,
@@ -128,69 +184,93 @@ struct SessionRegistry {
 }
 
 impl SessionRegistry {
-    fn single(mode: LaunchMode, workspace: &Workspace, area: Rect, now: Instant) -> Self {
-        let spec = match mode {
-            LaunchMode::Shell => checked_process_spec(
+    fn single(mode: LaunchMode, workspace: &Workspace, area: Rect, now: Instant) -> Result<Self> {
+        let source = match mode {
+            LaunchMode::Shell => ProcessSource::Static(checked_process_spec(
                 ShellBackend::system_default(),
                 BackendKind::Shell,
                 workspace,
-            ),
-            LaunchMode::Nvim => checked_process_spec(NvimBackend, BackendKind::Editor, workspace),
-            LaunchMode::Pi => checked_process_spec(PiBackend, BackendKind::Agent, workspace),
+            )),
+            LaunchMode::Nvim => managed_nvim_source(workspace)?,
+            LaunchMode::Pi => ProcessSource::Static(checked_process_spec(
+                PiBackend,
+                BackendKind::Agent,
+                workspace,
+            )),
             LaunchMode::Workbench => unreachable!("workbench uses multiple slots"),
         };
-        Self::from_slots(
-            [(
+        Ok(Self::from_sources(
+            vec![(
                 SessionKey::Pane(PaneId::Editor),
-                spec,
+                source,
                 terminal_content_size(area),
             )],
             now,
-        )
+        ))
     }
 
-    fn workbench(workspace: &Workspace, layout: WorkbenchLayout, now: Instant) -> Self {
+    fn workbench(workspace: &Workspace, layout: WorkbenchLayout, now: Instant) -> Result<Self> {
         let shell_spec = checked_process_spec(
             ShellBackend::system_default(),
             BackendKind::Shell,
             workspace,
         );
-        let mut registry = Self::from_slots(
-            [
+        let mut registry = Self::from_sources(
+            vec![
                 (
                     SessionKey::Pane(PaneId::Editor),
-                    checked_process_spec(NvimBackend, BackendKind::Editor, workspace),
+                    managed_nvim_source(workspace)?,
                     terminal_content_size(layout.editor),
                 ),
                 (
                     SessionKey::Pane(PaneId::Agent),
-                    checked_process_spec(PiBackend, BackendKind::Agent, workspace),
+                    ProcessSource::Static(checked_process_spec(
+                        PiBackend,
+                        BackendKind::Agent,
+                        workspace,
+                    )),
                     terminal_content_size(layout.agent),
                 ),
                 (
                     SessionKey::Shell(ShellTabId(1)),
-                    shell_spec.clone(),
+                    ProcessSource::Static(shell_spec.clone()),
                     shell_terminal_content_size(layout.bottom),
                 ),
             ],
             now,
         );
         registry.shell_spec = Some(shell_spec);
-        registry
+        Ok(registry)
     }
 
+    #[cfg(test)]
     fn from_slots<const N: usize>(
         slots: [(SessionKey, ProcessSpec, TerminalSize); N],
         now: Instant,
     ) -> Self {
+        Self::from_sources(
+            slots
+                .into_iter()
+                .map(|(key, spec, size)| (key, ProcessSource::Static(spec), size))
+                .collect(),
+            now,
+        )
+    }
+
+    fn from_sources(slots: Vec<(SessionKey, ProcessSource, TerminalSize)>, now: Instant) -> Self {
         let mut registry = Self {
             slots: slots
                 .into_iter()
-                .map(|(key, spec, size)| {
+                .map(|(key, source, size)| {
+                    let spec = match &source {
+                        ProcessSource::Static(spec) => spec.clone(),
+                        ProcessSource::ManagedNvim { .. } => ProcessSpec::new("nvim"),
+                    };
                     (
                         key,
                         SessionSlot {
                             spec,
+                            source,
                             size,
                             generation: 0,
                             policy: RestartPolicy::default(),
@@ -403,6 +483,7 @@ impl SessionRegistry {
         self.slots.insert(
             SessionKey::Shell(id),
             SessionSlot {
+                source: ProcessSource::Static(spec.clone()),
                 spec,
                 size,
                 generation: 0,
@@ -426,6 +507,7 @@ impl SessionRegistry {
             self.slots.insert(
                 SessionKey::Shell(replacement),
                 SessionSlot {
+                    source: ProcessSource::Static(removed.spec.clone()),
                     spec: removed.spec,
                     size: removed.size,
                     generation: 0,
@@ -467,6 +549,7 @@ impl SessionRegistry {
         if let SlotState::Running { session, .. } = &mut slot.state {
             session.terminate();
         }
+        slot.source.cleanup();
         let runtime = now.saturating_duration_since(started_at);
         slot.state = match slot.policy.failed(now, runtime) {
             RestartDecision::Backoff(delay) => SlotState::Backoff {
@@ -492,6 +575,23 @@ impl SessionRegistry {
         let Some(identity) = self.ids.allocate(slot.generation) else {
             return;
         };
+        match slot.source.next_spec() {
+            Ok(spec) => slot.spec = spec,
+            Err(error) => {
+                let message = format!(
+                    "failed to prepare {}: {error:#}",
+                    slot.source.display_name()
+                );
+                slot.state = match slot.policy.failed(now, Duration::ZERO) {
+                    RestartDecision::Backoff(delay) => SlotState::Backoff {
+                        until: now + delay,
+                        message,
+                    },
+                    RestartDecision::Paused => SlotState::Paused { message },
+                };
+                return;
+            }
+        }
         match TerminalSession::spawn(&slot.spec, slot.size, SCROLLBACK_LINES) {
             Ok(session) => {
                 slot.state = SlotState::Running {
@@ -501,6 +601,7 @@ impl SessionRegistry {
                 };
             }
             Err(error) => {
+                slot.source.cleanup();
                 let message = format!("failed to start {}: {error:#}", slot.spec.display_name);
                 slot.state = match slot.policy.failed(now, Duration::ZERO) {
                     RestartDecision::Backoff(delay) => SlotState::Backoff {
@@ -533,6 +634,7 @@ impl SessionRegistry {
             if let SlotState::Running { session, .. } = &mut slot.state {
                 session.terminate();
             }
+            slot.source.cleanup();
             slot.state = SlotState::Paused {
                 message: "shut down".to_string(),
             };
@@ -599,9 +701,9 @@ impl AppRuntime {
             WorkbenchLayout::calculate_visible(area, layout_config, workbench.visibility())
         });
         let sessions = if let Some(layout) = layout {
-            SessionRegistry::workbench(&workspace, layout, Instant::now())
+            SessionRegistry::workbench(&workspace, layout, Instant::now())?
         } else {
-            SessionRegistry::single(launch_mode, &workspace, area, Instant::now())
+            SessionRegistry::single(launch_mode, &workspace, area, Instant::now())?
         };
 
         Ok(Self {
@@ -1279,6 +1381,16 @@ impl Drop for AppRuntime {
     }
 }
 
+fn managed_nvim_source(workspace: &Workspace) -> Result<ProcessSource> {
+    let profile = ManagedNvimProfile::from_environment()?;
+    Ok(ProcessSource::ManagedNvim {
+        profile,
+        workspace: workspace.clone(),
+        current: None,
+        controller: NvimController::new(workspace.root().to_path_buf(), None),
+    })
+}
+
 fn checked_process_spec(
     backend: impl BackendSpec,
     expected_kind: BackendKind,
@@ -1815,6 +1927,48 @@ mod tests {
     }
 
     #[test]
+    fn managed_nvim_restart_replaces_controller_endpoint() {
+        let root = std::env::temp_dir().join(format!("ami-runtime-nvim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = Workspace::discover(&root).unwrap();
+        let profile = ManagedNvimProfile::materialize(root.join("state")).unwrap();
+        let mut source = ProcessSource::ManagedNvim {
+            profile,
+            workspace: workspace.clone(),
+            current: None,
+            controller: NvimController::new(workspace.root().to_path_buf(), None),
+        };
+        source.next_spec().unwrap();
+        let first = match &source {
+            ProcessSource::ManagedNvim { controller, .. } => {
+                controller.endpoint().unwrap().to_path_buf()
+            }
+            ProcessSource::Static(_) => unreachable!(),
+        };
+        source.next_spec().unwrap();
+        let second = match &source {
+            ProcessSource::ManagedNvim { controller, .. } => {
+                controller.endpoint().unwrap().to_path_buf()
+            }
+            ProcessSource::Static(_) => unreachable!(),
+        };
+        assert_ne!(first, second);
+        assert!(!first.exists());
+        std::fs::write(&second, b"ready").unwrap();
+        let remote = match &source {
+            ProcessSource::ManagedNvim { controller, .. } => {
+                controller.remote_open_spec("replacement.txt").unwrap()
+            }
+            ProcessSource::Static(_) => unreachable!(),
+        };
+        assert_eq!(remote.args[1], second.to_string_lossy());
+        source.cleanup();
+        assert!(!second.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn registry_keeps_independent_shell_slots_and_resizes_inactive_slot() {
         let spec = sleeping_shell_spec();
         let mut registry = SessionRegistry {
@@ -1824,6 +1978,7 @@ mod tests {
                     (
                         SessionKey::Shell(id),
                         SessionSlot {
+                            source: ProcessSource::Static(spec.clone()),
                             spec: spec.clone(),
                             size: TerminalSize::new(10, 4),
                             generation: 0,
