@@ -133,17 +133,20 @@ pub fn render_shell_terminal_pane(
 }
 
 fn tab_label(display_number: usize, width: u16, active: bool) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let marker = if active { "●" } else { " " };
-    let raw = format!("{marker}{display_number} ×");
-    let mut chars: String = raw.chars().take(width as usize).collect();
-    while chars.chars().count() < width as usize {
+    let body_width = usize::from(width - 1);
+    let mut chars: String = format!("{marker}{display_number}")
+        .chars()
+        .take(body_width)
+        .collect();
+    while chars.chars().count() < body_width {
         chars.push(' ');
     }
-    // Geometry assigns the final cell to close regardless of truncation.
-    if width > 0 {
-        chars.pop();
-        chars.push('×');
-    }
+    // Geometry assigns exactly the final cell to close.
+    chars.push('×');
     chars
 }
 
@@ -314,6 +317,17 @@ mod tests {
             shell_terminal_content_size(Rect::new(0, 0, 20, 5)),
             TerminalSize::new(18, 2)
         );
+    }
+
+    #[test]
+    fn shell_tab_label_has_exactly_one_close_cell() {
+        let label = tab_label(1, 7, true);
+        assert_eq!(label, "●1    ×");
+        assert_eq!(
+            label.chars().filter(|character| *character == '×').count(),
+            1
+        );
+        assert_eq!(label.chars().count(), 7);
     }
 
     #[test]
