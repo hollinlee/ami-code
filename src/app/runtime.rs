@@ -1607,7 +1607,8 @@ fn session_key(workbench: &WorkbenchState, pane: PaneId) -> SessionKey {
 }
 
 fn sidebar_viewport_rows(area: Rect) -> usize {
-    usize::from(area.height.saturating_sub(2))
+    const BORDER_ROWS: u16 = 2;
+    usize::from(area.height.saturating_sub(BORDER_ROWS))
 }
 
 fn activated_sidebar_row(pending: PendingMouseGesture, release: MouseEvent) -> Option<usize> {

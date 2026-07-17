@@ -572,7 +572,7 @@ impl Sidebar {
 
     fn reconcile_git(&mut self) {
         self.clear_git();
-        for change in self.git_changes.clone() {
+        for change in &self.git_changes {
             let Some(path) = safe_join(&self.root, &change.path) else {
                 continue;
             };
