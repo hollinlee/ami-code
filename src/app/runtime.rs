@@ -124,6 +124,7 @@ enum SessionKey {
 struct SessionRegistry {
     slots: HashMap<SessionKey, SessionSlot>,
     ids: SessionIds,
+    shell_spec: Option<ProcessSpec>,
 }
 
 impl SessionRegistry {
@@ -149,7 +150,12 @@ impl SessionRegistry {
     }
 
     fn workbench(workspace: &Workspace, layout: WorkbenchLayout, now: Instant) -> Self {
-        Self::from_slots(
+        let shell_spec = checked_process_spec(
+            ShellBackend::system_default(),
+            BackendKind::Shell,
+            workspace,
+        );
+        let mut registry = Self::from_slots(
             [
                 (
                     SessionKey::Pane(PaneId::Editor),
@@ -163,16 +169,14 @@ impl SessionRegistry {
                 ),
                 (
                     SessionKey::Shell(ShellTabId(1)),
-                    checked_process_spec(
-                        ShellBackend::system_default(),
-                        BackendKind::Shell,
-                        workspace,
-                    ),
+                    shell_spec.clone(),
                     shell_terminal_content_size(layout.bottom),
                 ),
             ],
             now,
-        )
+        );
+        registry.shell_spec = Some(shell_spec);
+        registry
     }
 
     fn from_slots<const N: usize>(
@@ -196,6 +200,7 @@ impl SessionRegistry {
                 })
                 .collect(),
             ids: SessionIds::new(),
+            shell_spec: None,
         };
         let keys: Vec<_> = registry.slots.keys().copied().collect();
         for key in keys {
@@ -390,15 +395,11 @@ impl SessionRegistry {
         Ok(exited_shells)
     }
 
-    fn add_shell(&mut self, id: ShellTabId, now: Instant) {
-        let template = self
-            .slots
-            .values()
-            .find(|slot| slot.spec.display_name == "shell")
-            .map(|slot| (slot.spec.clone(), slot.size));
-        let Some((spec, size)) = template else {
-            return;
-        };
+    fn add_shell(&mut self, id: ShellTabId, size: TerminalSize, now: Instant) -> Result<()> {
+        let spec = self
+            .shell_spec
+            .clone()
+            .context("shell tab registry is missing its process spec")?;
         self.slots.insert(
             SessionKey::Shell(id),
             SessionSlot {
@@ -410,6 +411,7 @@ impl SessionRegistry {
             },
         );
         self.spawn(SessionKey::Shell(id), now);
+        Ok(())
     }
 
     fn close_shell(&mut self, id: ShellTabId, replacement: Option<ShellTabId>, now: Instant) {
@@ -937,7 +939,8 @@ impl AppRuntime {
                     Some(ShellTabTarget::Close(id)) => self.close_shell_tab(id, Instant::now()),
                     Some(ShellTabTarget::Plus) => {
                         let id = self.workbench.shell_tabs_mut().new_tab();
-                        self.sessions.add_shell(id, Instant::now());
+                        let size = shell_terminal_content_size(layout.bottom);
+                        self.sessions.add_shell(id, size, Instant::now())?;
                     }
                     None => {}
                 }
@@ -1831,6 +1834,7 @@ mod tests {
                 })
                 .collect(),
             ids: SessionIds::new(),
+            shell_spec: Some(spec),
         };
         registry
             .resize_slot(
