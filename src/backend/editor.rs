@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use thiserror::Error;
 
-use super::{BackendKind, BackendSpec, build_backend_process_spec};
+use super::{BackendKind, build_backend_process_spec};
 use crate::terminal::ProcessSpec;
 use crate::workspace::Workspace;
 
@@ -222,10 +222,11 @@ impl NvimController {
     /// Executes a one-shot argv-based remote open. No path is interpreted by a shell.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<(), NvimRemoteError> {
         let spec = self.remote_open_spec(path)?;
+        let cwd = spec.cwd.as_ref().ok_or_else(|| {
+            NvimRemoteError::InvalidPath(anyhow::anyhow!("Nvim controller has no workspace cwd"))
+        })?;
         let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .current_dir(spec.cwd.as_ref().expect("controller cwd"));
+        command.args(&spec.args).current_dir(cwd);
         for (key, value) in &spec.env {
             command.env(key, value);
         }
@@ -237,24 +238,14 @@ impl NvimController {
     }
 }
 
-impl BackendSpec for NvimBackend {
-    fn kind(&self) -> BackendKind {
+#[allow(dead_code)]
+impl NvimBackend {
+    pub fn kind(self) -> BackendKind {
         BackendKind::Editor
     }
 
-    fn display_name(&self) -> &str {
+    pub fn display_name(self) -> &'static str {
         "nvim"
-    }
-
-    fn process_spec(&self, workspace: &Workspace) -> ProcessSpec {
-        let profile = ManagedNvimProfile::from_environment()
-            .expect("managed Nvim profile could not be materialized");
-        let generation = profile
-            .generation(workspace)
-            .expect("managed Nvim generation could not be created");
-        // Compatibility for generic BackendSpec callers. Runtime-managed Nvim
-        // retains the generation object so its endpoint receives lifecycle cleanup.
-        generation.spec.clone()
     }
 }
 
