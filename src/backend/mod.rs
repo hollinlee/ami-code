@@ -2,6 +2,8 @@ mod agent;
 mod editor;
 mod shell;
 
+#[allow(unused_imports)]
+pub use crate::workspace::WorkspaceTrustState as ProjectTrustMode;
 pub use agent::ManagedPiProfile;
 #[allow(unused_imports)]
 pub use editor::{

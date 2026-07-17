@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::{BackendKind, BackendSpec, build_backend_process_spec};
 use crate::terminal::ProcessSpec;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceTrustState};
 
 const PROFILE_VERSION: &str = "managed-v1";
 const SETTINGS: &[u8] = b"{}\n";
@@ -91,7 +91,19 @@ impl ManagedPiProfile {
         self.root.join("sessions").join(format!("{digest:x}"))
     }
 
+    /// Build a locked-down spec for compatibility with callers that have not yet
+    /// integrated trust resolution. This method never implicitly trusts a project.
     pub fn process_spec(&self, workspace: &Workspace) -> Result<ProcessSpec> {
+        self.process_spec_with_trust(workspace, WorkspaceTrustState::Untrusted)
+    }
+
+    /// Build a one-run Pi spec using the trust decision resolved for this exact
+    /// workspace generation.
+    pub fn process_spec_with_trust(
+        &self,
+        workspace: &Workspace,
+        trust: WorkspaceTrustState,
+    ) -> Result<ProcessSpec> {
         // Workspace roots are canonicalized by Workspace, making this hash stable
         // for aliases while keeping different roots isolated.
         let session_dir = self.session_dir(workspace);
@@ -107,16 +119,24 @@ impl ManagedPiProfile {
         let mut spec = PiBackend
             .process_spec(workspace)
             .env("PI_CODING_AGENT_DIR", profile_dir);
-        spec.args = [
+        spec.args = vec![
             "--session-dir".to_string(),
             session_dir_arg.to_owned(),
-            "--no-approve".to_string(),
-            "--no-extensions".to_string(),
-            "--no-skills".to_string(),
-            "--no-prompt-templates".to_string(),
-            "--no-themes".to_string(),
-        ]
-        .into();
+            match trust {
+                WorkspaceTrustState::Trusted => "--approve".to_string(),
+                WorkspaceTrustState::Untrusted | WorkspaceTrustState::Stale => {
+                    "--no-approve".to_string()
+                }
+            },
+        ];
+        if trust != WorkspaceTrustState::Trusted {
+            spec.args.extend([
+                "--no-extensions".to_string(),
+                "--no-skills".to_string(),
+                "--no-prompt-templates".to_string(),
+                "--no-themes".to_string(),
+            ]);
+        }
         Ok(spec)
     }
 }
@@ -574,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_sessions_are_stable_and_isolated_and_spec_is_locked_down() {
+    fn workspace_sessions_are_stable_and_isolated_and_untrusted_spec_is_locked_down() {
         let temp = TempDir::new().unwrap();
         let auth = source(&temp);
         let profile = ManagedPiProfile::materialize(temp.path().join("state"), auth).unwrap();
@@ -588,22 +608,66 @@ mod tests {
         assert_eq!(profile.session_dir(&one), profile.session_dir(&one_again));
         assert_ne!(profile.session_dir(&one), profile.session_dir(&two));
 
-        let spec = profile.process_spec(&one).unwrap();
-        assert_eq!(spec.cwd.as_deref(), Some(one.root()));
-        assert_eq!(
-            spec.env.get("PI_CODING_AGENT_DIR").map(PathBuf::from),
-            Some(profile.root.clone())
+        for trust in [WorkspaceTrustState::Untrusted, WorkspaceTrustState::Stale] {
+            let spec = profile.process_spec_with_trust(&one, trust).unwrap();
+            assert_eq!(spec.cwd.as_deref(), Some(one.root()));
+            assert_eq!(
+                spec.env.get("PI_CODING_AGENT_DIR").map(PathBuf::from),
+                Some(profile.root.clone())
+            );
+            for flag in [
+                "--session-dir",
+                "--no-approve",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+            ] {
+                assert!(spec.args.iter().any(|arg| arg == flag));
+            }
+            assert!(!spec.args.iter().any(|arg| arg == "--approve"));
+            assert!(!spec.args.iter().any(|arg| arg == "--no-context-files"));
+            assert!(!format!("{spec:?}").contains("TOP-SECRET-MARKER"));
+        }
+
+        // The compatibility entry point remains fail-closed.
+        assert!(
+            profile
+                .process_spec(&one)
+                .unwrap()
+                .args
+                .iter()
+                .any(|arg| arg == "--no-approve")
         );
-        for flag in [
-            "--session-dir",
+    }
+
+    #[test]
+    fn trusted_spec_approves_and_allows_project_resource_discovery() {
+        let temp = TempDir::new().unwrap();
+        let auth = source(&temp);
+        let profile = ManagedPiProfile::materialize(temp.path().join("state"), auth).unwrap();
+        let workspace_path = temp.path().join("workspace");
+        fs::create_dir(&workspace_path).unwrap();
+        let workspace = Workspace::discover(workspace_path).unwrap();
+
+        let spec = profile
+            .process_spec_with_trust(&workspace, WorkspaceTrustState::Trusted)
+            .unwrap();
+        assert!(spec.args.iter().any(|arg| arg == "--approve"));
+        for blocked in [
             "--no-approve",
             "--no-extensions",
             "--no-skills",
             "--no-prompt-templates",
             "--no-themes",
+            "--no-context-files",
         ] {
-            assert!(spec.args.iter().any(|arg| arg == flag));
+            assert!(!spec.args.iter().any(|arg| arg == blocked));
         }
-        assert!(!format!("{spec:?}").contains("TOP-SECRET-MARKER"));
+        assert!(spec.args.iter().any(|arg| arg == "--session-dir"));
+        assert_eq!(
+            spec.env.get("PI_CODING_AGENT_DIR").map(PathBuf::from),
+            Some(profile.root.clone())
+        );
     }
 }
