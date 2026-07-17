@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 
 use super::{
-    LayoutIntent, PaneId, PaneKind, PaneSelection, PaneState, WorkbenchLayoutConfig,
+    LayoutIntent, PaneId, PaneKind, PaneSelection, PaneState, ShellTabs, WorkbenchLayoutConfig,
     WorkbenchVisibility,
 };
 use crate::backend::BackendKind;
@@ -40,6 +40,7 @@ pub struct WorkbenchState {
     selection: Option<PaneSelection>,
     sidebar_collapse: CollapseState,
     bottom_collapse: CollapseState,
+    shell_tabs: ShellTabs,
 }
 
 impl Default for WorkbenchState {
@@ -55,11 +56,20 @@ impl Default for WorkbenchState {
             selection: None,
             sidebar_collapse: CollapseState::default(),
             bottom_collapse: CollapseState::default(),
+            shell_tabs: ShellTabs::default(),
         }
     }
 }
 
 impl WorkbenchState {
+    pub fn shell_tabs(&self) -> &ShellTabs {
+        &self.shell_tabs
+    }
+
+    pub fn shell_tabs_mut(&mut self) -> &mut ShellTabs {
+        &mut self.shell_tabs
+    }
+
     pub fn focused_pane(&self) -> PaneId {
         self.focused_pane
     }

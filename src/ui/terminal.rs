@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::{TerminalPoint, TerminalRange, TerminalSize};
+use crate::workbench::{ShellTabId, ShellTabs, shell_tab_geometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalPaneStyle {
@@ -22,6 +23,10 @@ impl Default for TerminalPaneStyle {
 
 pub fn terminal_content_size(area: Rect) -> TerminalSize {
     TerminalSize::new(area.width.saturating_sub(2), area.height.saturating_sub(2))
+}
+
+pub fn shell_terminal_content_size(area: Rect) -> TerminalSize {
+    TerminalSize::new(area.width.saturating_sub(2), area.height.saturating_sub(3))
 }
 
 pub fn render_compact_workbench(frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -56,6 +61,90 @@ pub fn render_unavailable_terminal_pane(
             .block(block),
         area,
     );
+}
+
+pub struct ShellTerminalPaneView<'a> {
+    pub screen: Option<&'a vt100::Screen>,
+    pub title: &'a str,
+    pub message: Option<&'a str>,
+    pub focused: bool,
+    pub selection: Option<TerminalRange>,
+    pub tabs: &'a ShellTabs,
+    pub style: TerminalPaneStyle,
+}
+
+pub fn render_shell_terminal_pane(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    view: ShellTerminalPaneView<'_>,
+) {
+    let block = Block::default()
+        .title(view.title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if view.focused {
+            view.style.focused_border
+        } else {
+            view.style.unfocused_border
+        }));
+    frame.render_widget(block, area);
+
+    let (geometry, plus) = shell_tab_geometry(area, view.tabs);
+    for tab in geometry {
+        let active = tab.id == view.tabs.active();
+        let label = tab_label(tab.id, tab.width, active);
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(
+            Paragraph::new(label).style(style),
+            Rect::new(tab.x, area.y + 1, tab.width, 1),
+        );
+    }
+    if let Some((x, y)) = plus {
+        frame.render_widget(
+            Paragraph::new("+").style(Style::default().fg(Color::LightGreen)),
+            Rect::new(x, y, 1, 1),
+        );
+    }
+
+    let content = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(3),
+    );
+    if let Some(screen) = view.screen {
+        frame.render_widget(
+            Paragraph::new(styled_screen_lines(screen, view.selection)),
+            content,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(view.message.unwrap_or("unavailable"))
+                .style(Style::default().fg(Color::Yellow)),
+            content,
+        );
+    }
+}
+
+fn tab_label(id: ShellTabId, width: u16, active: bool) -> String {
+    let marker = if active { "●" } else { " " };
+    let raw = format!("{marker}{} ×", id.0);
+    let mut chars: String = raw.chars().take(width as usize).collect();
+    while chars.chars().count() < width as usize {
+        chars.push(' ');
+    }
+    // Geometry assigns the final cell to close regardless of truncation.
+    if width > 0 {
+        chars.pop();
+        chars.push('×');
+    }
+    chars
 }
 
 pub fn render_terminal_pane(
@@ -216,6 +305,14 @@ mod tests {
         assert_eq!(
             terminal_content_size(Rect::new(0, 0, 1, 1)),
             TerminalSize::new(2, 2)
+        );
+        assert_eq!(
+            shell_terminal_content_size(Rect::new(0, 0, 120, 30)),
+            TerminalSize::new(118, 27)
+        );
+        assert_eq!(
+            shell_terminal_content_size(Rect::new(0, 0, 20, 5)),
+            TerminalSize::new(18, 2)
         );
     }
 

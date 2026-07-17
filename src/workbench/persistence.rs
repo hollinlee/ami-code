@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{MIN_TERMINAL_HEIGHT, MIN_TERMINAL_WIDTH, WorkbenchLayoutConfig};
+use super::{MIN_SHELL_PANE_HEIGHT, MIN_TERMINAL_WIDTH, WorkbenchLayoutConfig};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_SAVED_PANE_SIZE: u16 = 4_096;
@@ -187,7 +187,7 @@ fn validate(intent: LayoutIntent) -> Result<()> {
     validate_dimension(
         "bottom height",
         intent.config.bottom_height,
-        MIN_TERMINAL_HEIGHT,
+        MIN_SHELL_PANE_HEIGHT,
     )?;
     Ok(())
 }
