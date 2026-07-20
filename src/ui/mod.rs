@@ -1,3 +1,4 @@
+mod context_menu;
 mod sidebar;
 mod terminal;
 
@@ -6,6 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 
+pub use context_menu::{ContextMenu, ContextMenuAction, render_context_menu};
 pub use sidebar::{
     SidebarStyle, SidebarTrustChrome, SidebarTrustTarget, render_sidebar, sidebar_trust_hit,
     sidebar_trust_rows,
