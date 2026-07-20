@@ -6,7 +6,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 
-pub use sidebar::{SidebarStyle, render_sidebar};
+pub use sidebar::{
+    SidebarStyle, SidebarTrustChrome, SidebarTrustTarget, render_sidebar, sidebar_trust_hit,
+    sidebar_trust_rows,
+};
 pub use terminal::{
     ShellTerminalPaneView, TerminalPaneStyle, render_compact_workbench, render_shell_terminal_pane,
     render_terminal_pane, render_unavailable_terminal_pane, shell_terminal_content_size,

@@ -23,23 +23,25 @@ use crate::backend::{
 };
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
-    ShellTerminalPaneView, SidebarStyle, TerminalPaneStyle, render_compact_workbench,
-    render_layout_controls, render_shell_terminal_pane, render_sidebar, render_terminal_pane,
-    render_unavailable_terminal_pane, shell_terminal_content_size, terminal_content_size,
+    ShellTerminalPaneView, SidebarStyle, SidebarTrustChrome, SidebarTrustTarget, TerminalPaneStyle,
+    render_compact_workbench, render_layout_controls, render_shell_terminal_pane, render_sidebar,
+    render_terminal_pane, render_unavailable_terminal_pane, shell_terminal_content_size,
+    sidebar_trust_hit, sidebar_trust_rows, terminal_content_size,
 };
 use crate::workbench::{
     LayoutDivider, LayoutHandle, LayoutStore, MIN_SHELL_PANE_HEIGHT, MIN_TERMINAL_HEIGHT,
     MIN_TERMINAL_WIDTH, MouseTarget, PaneId, ShellTabId, ShellTabTarget, WorkbenchLayout,
     WorkbenchLayoutConfig, WorkbenchState, hit_test, shell_tab_hit_test,
 };
-use crate::workspace::Workspace;
 use crate::workspace::sidebar::{Sidebar, SidebarActivation};
+use crate::workspace::{Workspace, WorkspaceTrustState, WorkspaceTrustStore};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SCROLLBACK_LINES: usize = 1_000;
 const MOUSE_WHEEL_LINES: i32 = 3;
 const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 const EDGE_SCROLL_LINES: i32 = 1;
+const TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run(mode: LaunchMode) -> Result<()> {
     let workspace = Workspace::discover(std::env::current_dir()?)?;
@@ -130,6 +132,7 @@ enum ProcessSource {
     ManagedPi {
         workspace: Workspace,
         materialization: ManagedPiMaterialization,
+        trust_store: Option<WorkspaceTrustStore>,
     },
 }
 
@@ -186,7 +189,16 @@ impl ProcessSource {
             Self::ManagedPi {
                 workspace,
                 materialization,
-            } => materialization.profile()?.process_spec(workspace),
+                trust_store,
+            } => {
+                let trust = trust_store
+                    .as_ref()
+                    .and_then(|store| store.resolve().ok())
+                    .unwrap_or(WorkspaceTrustState::Untrusted);
+                materialization
+                    .profile()?
+                    .process_spec_with_trust(workspace, trust)
+            }
         }
     }
 
@@ -225,7 +237,13 @@ struct SessionRegistry {
 }
 
 impl SessionRegistry {
-    fn single(mode: LaunchMode, workspace: &Workspace, area: Rect, now: Instant) -> Result<Self> {
+    fn single(
+        mode: LaunchMode,
+        workspace: &Workspace,
+        trust_store: Option<WorkspaceTrustStore>,
+        area: Rect,
+        now: Instant,
+    ) -> Result<Self> {
         let source = match mode {
             LaunchMode::Shell => ProcessSource::Static(checked_process_spec(
                 ShellBackend::system_default(),
@@ -233,7 +251,7 @@ impl SessionRegistry {
                 workspace,
             )),
             LaunchMode::Nvim => managed_nvim_source(workspace)?,
-            LaunchMode::Pi => managed_pi_source(workspace),
+            LaunchMode::Pi => managed_pi_source(workspace, trust_store),
             LaunchMode::Workbench => unreachable!("workbench uses multiple slots"),
         };
         Ok(Self::from_sources(
@@ -246,7 +264,12 @@ impl SessionRegistry {
         ))
     }
 
-    fn workbench(workspace: &Workspace, layout: WorkbenchLayout, now: Instant) -> Result<Self> {
+    fn workbench(
+        workspace: &Workspace,
+        trust_store: Option<WorkspaceTrustStore>,
+        layout: WorkbenchLayout,
+        now: Instant,
+    ) -> Result<Self> {
         let shell_spec = checked_process_spec(
             ShellBackend::system_default(),
             BackendKind::Shell,
@@ -261,7 +284,7 @@ impl SessionRegistry {
                 ),
                 (
                     SessionKey::Pane(PaneId::Agent),
-                    managed_pi_source(workspace),
+                    managed_pi_source(workspace, trust_store),
                     terminal_content_size(layout.agent),
                 ),
                 (
@@ -673,6 +696,22 @@ impl SessionRegistry {
         }
     }
 
+    fn restart(&mut self, key: SessionKey, now: Instant) {
+        if self.ids.is_shutting_down() {
+            return;
+        }
+        let Some(slot) = self.slots.get_mut(&key) else {
+            return;
+        };
+        if let SlotState::Running { session, .. } = &mut slot.state {
+            session.terminate();
+        }
+        slot.source.cleanup();
+        slot.policy.reset();
+        slot.state = SlotState::Starting;
+        self.spawn(key, now);
+    }
+
     fn retry(&mut self, key: SessionKey, now: Instant) {
         if self.ids.is_shutting_down() || !self.slots.contains_key(&key) {
             return;
@@ -722,6 +761,11 @@ struct AppRuntime {
     pending_mouse: Option<PendingMouseGesture>,
     pending_layout: Option<PendingLayoutGesture>,
     layout_store: Option<LayoutStore>,
+    trust_store: Option<WorkspaceTrustStore>,
+    trust_state: WorkspaceTrustState,
+    trust_confirming: bool,
+    trust_status_message: Option<String>,
+    next_trust_refresh: Instant,
 }
 
 impl AppRuntime {
@@ -755,6 +799,27 @@ impl AppRuntime {
         } else {
             None
         };
+        let trust_relevant = matches!(launch_mode, LaunchMode::Pi | LaunchMode::Workbench);
+        let (trust_store, trust_state, trust_status_message) = if trust_relevant {
+            match WorkspaceTrustStore::from_environment(workspace.root()) {
+                Ok(store) => match store.resolve() {
+                    Ok(state) => (Some(store), state, None),
+                    Err(error) => {
+                        let message = format!("workspace trust unavailable: {error:#}");
+                        status = Some(message.clone());
+                        (Some(store), WorkspaceTrustState::Untrusted, Some(message))
+                    }
+                },
+                Err(error) => {
+                    let message = format!("workspace trust unavailable: {error:#}");
+                    status = Some(message.clone());
+                    (None, WorkspaceTrustState::Untrusted, Some(message))
+                }
+            }
+        } else {
+            (None, WorkspaceTrustState::Untrusted, None)
+        };
+
         // Loaded user intent is installed before this first automatic solve and
         // before SessionRegistry receives initial PTY dimensions.
         let layout = launch_mode.is_workbench().then(|| {
@@ -762,9 +827,15 @@ impl AppRuntime {
             WorkbenchLayout::calculate_visible(area, layout_config, workbench.visibility())
         });
         let sessions = if let Some(layout) = layout {
-            SessionRegistry::workbench(&workspace, layout, Instant::now())?
+            SessionRegistry::workbench(&workspace, trust_store.clone(), layout, Instant::now())?
         } else {
-            SessionRegistry::single(launch_mode, &workspace, area, Instant::now())?
+            SessionRegistry::single(
+                launch_mode,
+                &workspace,
+                trust_store.clone(),
+                area,
+                Instant::now(),
+            )?
         };
         let (sidebar, sidebar_error) = if launch_mode.is_workbench() {
             match Sidebar::new(workspace.root().to_path_buf()) {
@@ -792,10 +863,19 @@ impl AppRuntime {
             pending_mouse: None,
             pending_layout: None,
             layout_store,
+            trust_store,
+            trust_state,
+            trust_confirming: false,
+            trust_status_message,
+            next_trust_refresh: Instant::now() + TRUST_REFRESH_INTERVAL,
         })
     }
 
     fn poll_sessions_at(&mut self, now: Instant) -> Result<()> {
+        if now >= self.next_trust_refresh {
+            self.next_trust_refresh = now + TRUST_REFRESH_INTERVAL;
+            self.refresh_trust_state(now);
+        }
         if let Some(sidebar) = &mut self.sidebar {
             sidebar.tick();
         }
@@ -912,7 +992,8 @@ impl AppRuntime {
             return;
         }
         if layout.sidebar.width > 0 && layout.sidebar.height > 0 {
-            let viewport_rows = sidebar_viewport_rows(layout.sidebar);
+            let trust = self.sidebar_trust_chrome();
+            let viewport_rows = sidebar_tree_viewport_rows(layout.sidebar, trust);
             let rows = self
                 .sidebar
                 .as_ref()
@@ -927,6 +1008,7 @@ impl AppRuntime {
                 frame,
                 layout.sidebar,
                 &rows,
+                trust,
                 error,
                 self.workbench.is_focused(PaneId::Sidebar),
                 SidebarStyle::default(),
@@ -1337,14 +1419,20 @@ impl AppRuntime {
     ) -> Result<()> {
         if matches!(pending.target, MouseTarget::Sidebar { .. }) {
             if let Some(row) = activated_sidebar_row(pending, release) {
+                let trust = self.sidebar_trust_chrome();
+                if let Some(target) = sidebar_trust_hit(trust, row) {
+                    self.activate_trust_target(target);
+                    return Ok(());
+                }
                 let viewport_rows = self
                     .layout
-                    .map(|layout| sidebar_viewport_rows(layout.sidebar))
+                    .map(|layout| sidebar_tree_viewport_rows(layout.sidebar, trust))
                     .unwrap_or(0);
+                let tree_row = row.saturating_sub(sidebar_trust_rows(trust));
                 let activation = self
                     .sidebar
                     .as_mut()
-                    .and_then(|sidebar| sidebar.click_visible_row(row, viewport_rows));
+                    .and_then(|sidebar| sidebar.click_visible_row(tree_row, viewport_rows));
                 if let Some(SidebarActivation::OpenFile(path)) = activation {
                     apply_sidebar_open_result(
                         &mut self.workbench,
@@ -1412,9 +1500,10 @@ impl AppRuntime {
                 MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => 0,
                 _ => return Ok(()),
             };
+            let trust = self.sidebar_trust_chrome();
             let viewport_rows = self
                 .layout
-                .map(|layout| sidebar_viewport_rows(layout.sidebar))
+                .map(|layout| sidebar_tree_viewport_rows(layout.sidebar, trust))
                 .unwrap_or(0);
             if let Some(sidebar) = &mut self.sidebar {
                 sidebar.scroll(delta, viewport_rows);
@@ -1485,6 +1574,75 @@ impl AppRuntime {
         Ok(())
     }
 
+    fn sidebar_trust_chrome(&self) -> SidebarTrustChrome {
+        SidebarTrustChrome {
+            state: self.trust_state,
+            confirming: self.trust_confirming,
+        }
+    }
+
+    fn refresh_trust_state(&mut self, now: Instant) {
+        let Some(store) = self.trust_store.clone() else {
+            self.trust_state = WorkspaceTrustState::Untrusted;
+            return;
+        };
+        let previous = self.trust_state;
+        match store.resolve() {
+            Ok(state) => {
+                self.trust_state = state;
+                self.clear_trust_status();
+            }
+            Err(error) => {
+                self.trust_state = WorkspaceTrustState::Untrusted;
+                self.set_trust_status(format!("workspace trust unavailable: {error:#}"));
+            }
+        }
+        if trust_capability_changed(previous, self.trust_state)
+            && let Some(key) = trust_restart_key(self.launch_mode)
+        {
+            self.sessions.restart(key, now);
+        }
+    }
+
+    fn activate_trust_target(&mut self, target: SidebarTrustTarget) {
+        match target {
+            SidebarTrustTarget::Review => self.trust_confirming = true,
+            SidebarTrustTarget::Cancel => self.trust_confirming = false,
+            SidebarTrustTarget::Chrome => {}
+            SidebarTrustTarget::ConfirmTrust => self.persist_trust_change(true),
+            SidebarTrustTarget::Revoke => self.persist_trust_change(false),
+        }
+    }
+
+    fn persist_trust_change(&mut self, trust: bool) {
+        let Some(store) = self.trust_store.clone() else {
+            self.set_status("workspace trust persistence is unavailable");
+            return;
+        };
+        if let Err(error) = persist_workspace_trust(&store, trust) {
+            self.set_status(format!("failed to save workspace trust: {error:#}"));
+            return;
+        }
+        self.trust_confirming = false;
+        match store.resolve() {
+            Ok(state) => {
+                self.trust_state = state;
+                self.clear_trust_status();
+                self.status = None;
+            }
+            Err(error) => {
+                self.trust_state = WorkspaceTrustState::Untrusted;
+                self.set_trust_status(format!("workspace trust unavailable: {error:#}"));
+            }
+        }
+        // Persistence already changed. Even if post-write verification failed,
+        // restart Pi so its next generation resolves fail-closed instead of
+        // retaining capabilities from the previous trusted process.
+        if let Some(key) = trust_restart_key(self.launch_mode) {
+            self.sessions.restart(key, Instant::now());
+        }
+    }
+
     fn save_layout_intent(&mut self) {
         let Some(store) = &self.layout_store else {
             return;
@@ -1504,6 +1662,18 @@ impl AppRuntime {
         }
     }
 
+    fn set_trust_status(&mut self, message: String) {
+        self.status = Some(message.clone());
+        self.trust_status_message = Some(message);
+    }
+
+    fn clear_trust_status(&mut self) {
+        if self.status.as_ref() == self.trust_status_message.as_ref() {
+            self.status = None;
+        }
+        self.trust_status_message = None;
+    }
+
     fn set_status(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
     }
@@ -1513,6 +1683,10 @@ impl Drop for AppRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn persist_workspace_trust(store: &WorkspaceTrustStore, trust: bool) -> Result<()> {
+    if trust { store.trust() } else { store.revoke() }
 }
 
 fn open_managed_nvim_source_file_with<F>(
@@ -1574,10 +1748,14 @@ fn apply_sidebar_open_result(
     }
 }
 
-fn managed_pi_source(workspace: &Workspace) -> ProcessSource {
+fn managed_pi_source(
+    workspace: &Workspace,
+    trust_store: Option<WorkspaceTrustStore>,
+) -> ProcessSource {
     ProcessSource::ManagedPi {
         workspace: workspace.clone(),
         materialization: ManagedPiMaterialization::Environment,
+        trust_store,
     }
 }
 
@@ -1698,6 +1876,18 @@ fn mouse_at(mut event: MouseEvent, row: u16, col: u16) -> MouseEvent {
     event
 }
 
+fn trust_capability_changed(previous: WorkspaceTrustState, current: WorkspaceTrustState) -> bool {
+    (previous == WorkspaceTrustState::Trusted) != (current == WorkspaceTrustState::Trusted)
+}
+
+fn trust_restart_key(launch_mode: LaunchMode) -> Option<SessionKey> {
+    match launch_mode {
+        LaunchMode::Workbench => Some(SessionKey::Pane(PaneId::Agent)),
+        LaunchMode::Pi => Some(SessionKey::Pane(PaneId::Editor)),
+        LaunchMode::Shell | LaunchMode::Nvim => None,
+    }
+}
+
 fn session_key(workbench: &WorkbenchState, pane: PaneId) -> SessionKey {
     if pane == PaneId::Bottom {
         SessionKey::Shell(workbench.shell_tabs().active())
@@ -1709,6 +1899,10 @@ fn session_key(workbench: &WorkbenchState, pane: PaneId) -> SessionKey {
 fn sidebar_viewport_rows(area: Rect) -> usize {
     const BORDER_ROWS: u16 = 2;
     usize::from(area.height.saturating_sub(BORDER_ROWS))
+}
+
+fn sidebar_tree_viewport_rows(area: Rect, trust: SidebarTrustChrome) -> usize {
+    sidebar_viewport_rows(area).saturating_sub(sidebar_trust_rows(trust))
 }
 
 fn activated_sidebar_row(pending: PendingMouseGesture, release: MouseEvent) -> Option<usize> {
@@ -2358,6 +2552,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_trust_write_returns_before_any_restart_decision() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let state = temp.path().join("state");
+        std::fs::create_dir(&workspace).unwrap();
+        let store = WorkspaceTrustStore::new(&workspace, &state).unwrap();
+        let trust_directory = state.join("trust");
+        std::fs::remove_dir(&trust_directory).unwrap();
+        std::fs::write(&trust_directory, b"not a directory").unwrap();
+        assert!(persist_workspace_trust(&store, true).is_err());
+    }
+
+    #[test]
+    fn trust_capability_transitions_restart_only_the_agent_slot() {
+        assert!(trust_capability_changed(
+            WorkspaceTrustState::Trusted,
+            WorkspaceTrustState::Untrusted
+        ));
+        assert!(trust_capability_changed(
+            WorkspaceTrustState::Stale,
+            WorkspaceTrustState::Trusted
+        ));
+        assert!(!trust_capability_changed(
+            WorkspaceTrustState::Untrusted,
+            WorkspaceTrustState::Stale
+        ));
+        assert_eq!(
+            trust_restart_key(LaunchMode::Workbench),
+            Some(SessionKey::Pane(PaneId::Agent))
+        );
+        assert_eq!(
+            trust_restart_key(LaunchMode::Pi),
+            Some(SessionKey::Pane(PaneId::Editor))
+        );
+        assert_eq!(trust_restart_key(LaunchMode::Nvim), None);
+        assert_eq!(trust_restart_key(LaunchMode::Shell), None);
+    }
+
+    #[test]
+    fn managed_pi_generation_resolves_trust_each_time_and_stale_is_locked_down() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace_path = temp.path().join("workspace");
+        let auth_dir = temp.path().join("auth");
+        std::fs::create_dir(&workspace_path).unwrap();
+        std::fs::create_dir(&auth_dir).unwrap();
+        let auth = auth_dir.join("auth.json");
+        std::fs::write(&auth, b"{}\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&auth, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let workspace = Workspace::discover(&workspace_path).unwrap();
+        let store =
+            WorkspaceTrustStore::new(&workspace_path, temp.path().join("trust-state")).unwrap();
+        let mut source = ProcessSource::ManagedPi {
+            workspace,
+            materialization: ManagedPiMaterialization::Explicit {
+                state_root: temp.path().join("pi-state"),
+                auth_source: auth,
+            },
+            trust_store: Some(store.clone()),
+        };
+
+        let first = source.next_spec().unwrap();
+        assert!(first.args.iter().any(|arg| arg == "--no-approve"));
+        store.trust().unwrap();
+        let trusted = source.next_spec().unwrap();
+        assert!(trusted.args.iter().any(|arg| arg == "--approve"));
+        assert!(!trusted.args.iter().any(|arg| arg.starts_with("--no-")));
+
+        let old = temp.path().join("old-workspace");
+        std::fs::rename(&workspace_path, old).unwrap();
+        std::fs::create_dir(&workspace_path).unwrap();
+        let stale = source.next_spec().unwrap();
+        assert!(stale.args.iter().any(|arg| arg == "--no-approve"));
+        assert!(stale.args.iter().any(|arg| arg == "--no-extensions"));
+    }
+
+    #[test]
+    fn sidebar_tree_viewport_excludes_normal_and_prompt_chrome() {
+        let area = Rect::new(0, 0, 24, 12);
+        let normal = SidebarTrustChrome {
+            state: WorkspaceTrustState::Untrusted,
+            confirming: false,
+        };
+        let prompt = SidebarTrustChrome {
+            confirming: true,
+            ..normal
+        };
+        assert_eq!(sidebar_tree_viewport_rows(area, normal), 9);
+        assert_eq!(sidebar_tree_viewport_rows(area, prompt), 6);
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_pi_preparation_failure_is_lazy_and_retryable() {
@@ -2378,6 +2665,7 @@ mod tests {
                 state_root: temp.path().join("state"),
                 auth_source: auth.clone(),
             },
+            trust_store: None,
         };
 
         let error = source.next_spec().unwrap_err();

@@ -49,7 +49,14 @@ enum RootIdentity {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum FilesystemIdentity {
     #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
+    Unix {
+        device: u64,
+        inode: u64,
+        #[cfg(target_os = "macos")]
+        birth_seconds: i64,
+        #[cfg(target_os = "macos")]
+        birth_nanoseconds: i64,
+    },
     #[cfg(windows)]
     Windows { volume: u32, file_index: u64 },
 }
@@ -281,6 +288,18 @@ fn root_key(identity: &RootIdentity) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
+/// Stable key for workspace-generation-owned state such as Pi sessions.
+/// It combines canonical path identity with the current filesystem object.
+pub fn workspace_generation_key(path: &Path) -> Result<String> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve workspace generation: {}", path.display()))?;
+    let encoded =
+        serde_json::to_vec(&(root_identity(&canonical), filesystem_identity(&canonical)?))
+            .context("failed to encode workspace generation identity")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
 fn filesystem_identity(path: &Path) -> Result<FilesystemIdentity> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("failed to inspect workspace identity: {}", path.display()))?;
@@ -292,10 +311,16 @@ fn filesystem_identity(path: &Path) -> Result<FilesystemIdentity> {
     }
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
+        use std::os::macos::fs::MetadataExt as MacMetadataExt;
         use std::os::unix::fs::MetadataExt;
         Ok(FilesystemIdentity::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
+            #[cfg(target_os = "macos")]
+            birth_seconds: metadata.st_birthtime(),
+            #[cfg(target_os = "macos")]
+            birth_nanoseconds: metadata.st_birthtime_nsec(),
         })
     }
     #[cfg(windows)]
@@ -432,6 +457,27 @@ mod tests {
         assert_eq!(store.resolve().unwrap(), WorkspaceTrustState::Trusted);
         store.revoke().unwrap();
         assert_eq!(store.resolve().unwrap(), WorkspaceTrustState::Untrusted);
+    }
+
+    #[test]
+    fn trusted_state_survives_store_recreation() {
+        let (_temp, workspace, state) = fixture();
+        WorkspaceTrustStore::new(&workspace, &state)
+            .unwrap()
+            .trust()
+            .unwrap();
+        let recreated = WorkspaceTrustStore::new(&workspace, &state).unwrap();
+        assert_eq!(recreated.resolve().unwrap(), WorkspaceTrustState::Trusted);
+    }
+
+    #[test]
+    fn write_failure_is_reported_without_changing_to_trusted() {
+        let (_temp, workspace, state) = fixture();
+        let store = WorkspaceTrustStore::new(&workspace, &state).unwrap();
+        fs::remove_dir(&store.directory).unwrap();
+        fs::write(&store.directory, b"not a directory").unwrap();
+        assert!(store.trust().is_err());
+        assert_ne!(store.resolve().ok(), Some(WorkspaceTrustState::Trusted));
     }
 
     #[test]

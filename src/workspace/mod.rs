@@ -5,7 +5,7 @@ pub mod sidebar;
 pub mod trust;
 
 #[allow(unused_imports)]
-pub use trust::{WorkspaceTrustState, WorkspaceTrustStore};
+pub use trust::{WorkspaceTrustState, WorkspaceTrustStore, workspace_generation_key};
 
 use anyhow::{Context, Result};
 
