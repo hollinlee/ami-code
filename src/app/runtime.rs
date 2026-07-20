@@ -2182,6 +2182,69 @@ mod tests {
     }
 
     #[test]
+    fn nvim_and_pi_crash_loops_pause_independently() {
+        fn crash_until_paused(
+            registry: &mut SessionRegistry,
+            key: SessionKey,
+            mut now: Instant,
+        ) -> Instant {
+            for failure in 0..6 {
+                let identity = match &registry.slots[&key].state {
+                    SlotState::Running { identity, .. } => *identity,
+                    _ => panic!("expected running slot before failure {failure}"),
+                };
+                now += Duration::from_millis(1);
+                registry
+                    .handle_failure(key, identity, now, format!("quick failure {failure}"))
+                    .unwrap();
+                if failure == 5 {
+                    assert!(matches!(
+                        registry.slots[&key].state,
+                        SlotState::Paused { .. }
+                    ));
+                    break;
+                }
+                let until = match registry.slots[&key].state {
+                    SlotState::Backoff { until, .. } => until,
+                    _ => panic!("expected backoff after failure {failure}"),
+                };
+                registry.poll(until).unwrap();
+                assert!(matches!(
+                    registry.slots[&key].state,
+                    SlotState::Running { .. }
+                ));
+                now = until;
+            }
+            now
+        }
+
+        let now = Instant::now();
+        let mut spec = ProcessSpec::new("/bin/sleep");
+        spec.args = vec!["30".to_string()];
+        let editor = SessionKey::Pane(PaneId::Editor);
+        let agent = SessionKey::Pane(PaneId::Agent);
+        let mut registry = SessionRegistry::from_slots(
+            [
+                (editor, spec.clone(), TerminalSize::new(20, 5)),
+                (agent, spec, TerminalSize::new(20, 5)),
+            ],
+            now,
+        );
+
+        let now = crash_until_paused(&mut registry, agent, now);
+        assert!(matches!(
+            registry.slots[&editor].state,
+            SlotState::Running { .. }
+        ));
+        crash_until_paused(&mut registry, editor, now);
+        assert!(matches!(
+            registry.slots[&agent].state,
+            SlotState::Paused { .. }
+        ));
+        registry.shutdown();
+    }
+
+    #[test]
     fn unavailable_status_uses_reachable_retry_hint() {
         assert_eq!(retry_hint(true), "click to retry");
         assert_eq!(retry_hint(false), "press any key to retry");
@@ -2460,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_nvim_file_open_calls_once_only_while_current_generation_is_running() {
+    fn managed_nvim_file_open_loop_delivers_once_per_activation_only_while_running() {
         use std::cell::Cell;
 
         let temp = tempfile::TempDir::new().unwrap();
@@ -2478,20 +2541,22 @@ mod tests {
         };
         source.next_spec().unwrap();
         let calls = Cell::new(0);
-        let result = open_managed_nvim_source_file_with(&source, true, &file, |_, opened| {
-            calls.set(calls.get() + 1);
-            assert_eq!(opened, file);
-            Ok(())
-        });
-        assert_eq!(result, FileOpenDelivery::Opened);
-        assert_eq!(calls.get(), 1);
+        for _ in 0..100 {
+            let result = open_managed_nvim_source_file_with(&source, true, &file, |_, opened| {
+                calls.set(calls.get() + 1);
+                assert_eq!(opened, file);
+                Ok(())
+            });
+            assert_eq!(result, FileOpenDelivery::Opened);
+        }
+        assert_eq!(calls.get(), 100);
 
         let result = open_managed_nvim_source_file_with(&source, false, &file, |_, _| {
             calls.set(calls.get() + 1);
             Ok(())
         });
         assert_eq!(result, FileOpenDelivery::Unavailable);
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), 100);
         source.cleanup();
     }
 

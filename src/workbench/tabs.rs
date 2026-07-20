@@ -214,6 +214,24 @@ mod tests {
     }
 
     #[test]
+    fn one_hundred_last_tab_replacements_never_reuse_identity() {
+        let mut tabs = ShellTabs::default();
+        let mut previous = tabs.active();
+        for _ in 0..100 {
+            let (_, replacement) = tabs.close(previous).unwrap();
+            let replacement = replacement.expect("closing the last tab creates a replacement");
+            assert!(replacement > previous);
+            assert_eq!(tabs.len(), 1);
+            assert_eq!(tabs.active(), replacement);
+            let (geometry, _) = shell_tab_geometry(Rect::new(0, 0, 20, 6), &tabs);
+            assert_eq!(geometry[0].display_number, 1);
+            previous = replacement;
+        }
+        assert_eq!(previous, ShellTabId(101));
+        assert_eq!(tabs.new_tab(), ShellTabId(102));
+    }
+
+    #[test]
     fn geometry_distinguishes_body_close_plus_and_keeps_active_in_overflow() {
         let mut tabs = ShellTabs::default();
         for _ in 0..8 {
