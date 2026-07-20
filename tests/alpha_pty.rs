@@ -87,7 +87,9 @@ fn right_click_menu_is_frontend_owned_and_dismissible() {
 
     // SGR mouse coordinates are one-based. This is inside Nvim content.
     app.send(b"\x1b[<2;30;5M");
-    app.expect_screen("right-click Paste menu", |screen| screen.contains("Paste"));
+    app.expect_screen("fixed right-click menu", |screen| {
+        screen.contains("Copy") && screen.contains("Paste")
+    });
 
     // Clicking outside the menu closes it and is consumed by frontend chrome.
     app.send(b"\x1b[<0;2;2M\x1b[<0;2;2m");

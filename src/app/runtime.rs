@@ -1226,7 +1226,12 @@ impl AppRuntime {
         let Some(layout) = self.layout else {
             return Ok(());
         };
-        if let Some(context) = self.context_menu {
+        if let Some(mut context) = self.context_menu {
+            if event.kind == MouseEventKind::Moved {
+                context.menu.update_hover(event.column, event.row);
+                self.context_menu = Some(context);
+                return Ok(());
+            }
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.context_menu = None;
                 match context.menu.action_at(event.column, event.row) {
