@@ -1590,10 +1590,18 @@ impl AppRuntime {
         match store.resolve() {
             Ok(state) => {
                 self.trust_state = state;
+                self.trust_confirming =
+                    trust_confirmation_after_refresh(self.trust_confirming, previous, state, false);
                 self.clear_trust_status();
             }
             Err(error) => {
                 self.trust_state = WorkspaceTrustState::Untrusted;
+                self.trust_confirming = trust_confirmation_after_refresh(
+                    self.trust_confirming,
+                    previous,
+                    WorkspaceTrustState::Untrusted,
+                    true,
+                );
                 self.set_trust_status(format!("workspace trust unavailable: {error:#}"));
             }
         }
@@ -1874,6 +1882,15 @@ fn mouse_at(mut event: MouseEvent, row: u16, col: u16) -> MouseEvent {
     event.row = row;
     event.column = col;
     event
+}
+
+fn trust_confirmation_after_refresh(
+    confirming: bool,
+    previous: WorkspaceTrustState,
+    current: WorkspaceTrustState,
+    resolve_failed: bool,
+) -> bool {
+    confirming && !resolve_failed && previous == current
 }
 
 fn trust_capability_changed(previous: WorkspaceTrustState, current: WorkspaceTrustState) -> bool {
@@ -2563,6 +2580,34 @@ mod tests {
         std::fs::remove_dir(&trust_directory).unwrap();
         std::fs::write(&trust_directory, b"not a directory").unwrap();
         assert!(persist_workspace_trust(&store, true).is_err());
+    }
+
+    #[test]
+    fn trust_refresh_cancels_stale_confirmation_prompts() {
+        assert!(!trust_confirmation_after_refresh(
+            true,
+            WorkspaceTrustState::Untrusted,
+            WorkspaceTrustState::Trusted,
+            false
+        ));
+        assert!(!trust_confirmation_after_refresh(
+            true,
+            WorkspaceTrustState::Untrusted,
+            WorkspaceTrustState::Untrusted,
+            true
+        ));
+        assert!(trust_confirmation_after_refresh(
+            true,
+            WorkspaceTrustState::Untrusted,
+            WorkspaceTrustState::Untrusted,
+            false
+        ));
+        assert!(!trust_confirmation_after_refresh(
+            false,
+            WorkspaceTrustState::Untrusted,
+            WorkspaceTrustState::Untrusted,
+            false
+        ));
     }
 
     #[test]
