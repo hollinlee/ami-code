@@ -3,7 +3,45 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::workspace::WorkspaceTrustState;
 use crate::workspace::sidebar::{EntryKind, GitStatus, SidebarRow};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarTrustChrome {
+    pub state: WorkspaceTrustState,
+    pub confirming: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarTrustTarget {
+    Review,
+    Revoke,
+    ConfirmTrust,
+    Cancel,
+    Chrome,
+}
+
+pub fn sidebar_trust_rows(chrome: SidebarTrustChrome) -> usize {
+    if chrome.confirming { 4 } else { 1 }
+}
+
+pub fn sidebar_trust_hit(chrome: SidebarTrustChrome, row: usize) -> Option<SidebarTrustTarget> {
+    if chrome.confirming {
+        return match row {
+            0 | 1 => Some(SidebarTrustTarget::Chrome),
+            2 => Some(SidebarTrustTarget::ConfirmTrust),
+            3 => Some(SidebarTrustTarget::Cancel),
+            _ => None,
+        };
+    }
+    if row != 0 {
+        return None;
+    }
+    Some(match chrome.state {
+        WorkspaceTrustState::Trusted => SidebarTrustTarget::Revoke,
+        WorkspaceTrustState::Untrusted | WorkspaceTrustState::Stale => SidebarTrustTarget::Review,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidebarStyle {
@@ -24,6 +62,7 @@ pub fn render_sidebar(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     rows: &[SidebarRow],
+    trust: SidebarTrustChrome,
     error: Option<&str>,
     focused: bool,
     style: SidebarStyle,
@@ -41,8 +80,9 @@ pub fn render_sidebar(
         } else {
             style.unfocused_border
         }));
-    let mut lines = rows.iter().map(sidebar_line).collect::<Vec<_>>();
-    if lines.is_empty()
+    let mut lines = trust_lines(trust);
+    lines.extend(rows.iter().map(sidebar_line));
+    if rows.is_empty()
         && let Some(error) = error
     {
         lines.push(Line::styled(
@@ -52,6 +92,32 @@ pub fn render_sidebar(
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn trust_lines(chrome: SidebarTrustChrome) -> Vec<Line<'static>> {
+    if chrome.confirming {
+        return vec![
+            Line::styled(
+                "Project resources may",
+                Style::default().fg(Color::LightRed),
+            ),
+            Line::styled(
+                "execute arbitrary code.",
+                Style::default().fg(Color::LightRed),
+            ),
+            Line::styled(
+                "[ Trust + restart Pi ]",
+                Style::default().fg(Color::LightGreen),
+            ),
+            Line::styled("[ Cancel ]", Style::default().fg(Color::Gray)),
+        ];
+    }
+    let (label, color) = match chrome.state {
+        WorkspaceTrustState::Untrusted => ("Untrusted — click to trust", Color::Yellow),
+        WorkspaceTrustState::Stale => ("Stale trust — click review", Color::LightRed),
+        WorkspaceTrustState::Trusted => ("Trusted — click to revoke", Color::LightGreen),
+    };
+    vec![Line::styled(label, Style::default().fg(color))]
 }
 
 fn sidebar_line(row: &SidebarRow) -> Line<'static> {
@@ -149,6 +215,39 @@ fn git_color(status: Option<GitStatus>) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_chrome_rows_and_hits_are_frontend_owned() {
+        let normal = SidebarTrustChrome {
+            state: WorkspaceTrustState::Untrusted,
+            confirming: false,
+        };
+        assert_eq!(sidebar_trust_rows(normal), 1);
+        assert_eq!(
+            sidebar_trust_hit(normal, 0),
+            Some(SidebarTrustTarget::Review)
+        );
+        assert_eq!(sidebar_trust_hit(normal, 1), None);
+
+        let prompt = SidebarTrustChrome {
+            confirming: true,
+            ..normal
+        };
+        assert_eq!(sidebar_trust_rows(prompt), 4);
+        assert_eq!(
+            sidebar_trust_hit(prompt, 0),
+            Some(SidebarTrustTarget::Chrome)
+        );
+        assert_eq!(
+            sidebar_trust_hit(prompt, 2),
+            Some(SidebarTrustTarget::ConfirmTrust)
+        );
+        assert_eq!(
+            sidebar_trust_hit(prompt, 3),
+            Some(SidebarTrustTarget::Cancel)
+        );
+        assert_eq!(sidebar_trust_hit(prompt, 4), None);
+    }
 
     #[test]
     fn maps_every_git_status_to_the_expected_marker() {

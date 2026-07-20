@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
 
 pub mod sidebar;
+#[allow(dead_code)]
+pub mod trust;
+
+#[allow(unused_imports)]
+pub use trust::{WorkspaceTrustState, WorkspaceTrustStore, workspace_generation_key};
 
 use anyhow::{Context, Result};
 
