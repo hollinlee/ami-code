@@ -2211,6 +2211,9 @@ impl Drop for TerminalStateGuard {
 mod tests {
     use super::*;
 
+    const QUICK_FAILURES_TO_PAUSE: usize = 6;
+    const SIDEBAR_OPEN_SOAK_ITERATIONS: usize = 100;
+
     fn sleeping_shell_spec() -> ProcessSpec {
         let mut spec = ProcessSpec::new("/bin/sh").display_name("shell");
         spec.args = vec!["-c".to_string(), "sleep 30".to_string()];
@@ -2284,7 +2287,7 @@ mod tests {
             key: SessionKey,
             mut now: Instant,
         ) -> Instant {
-            for failure in 0..6 {
+            for failure in 0..QUICK_FAILURES_TO_PAUSE {
                 let identity = match &registry.slots[&key].state {
                     SlotState::Running { identity, .. } => *identity,
                     _ => panic!("expected running slot before failure {failure}"),
@@ -2293,7 +2296,7 @@ mod tests {
                 registry
                     .handle_failure(key, identity, now, format!("quick failure {failure}"))
                     .unwrap();
-                if failure == 5 {
+                if failure + 1 == QUICK_FAILURES_TO_PAUSE {
                     assert!(matches!(
                         registry.slots[&key].state,
                         SlotState::Paused { .. }
@@ -2680,7 +2683,7 @@ mod tests {
         };
         source.next_spec().unwrap();
         let calls = Cell::new(0);
-        for _ in 0..100 {
+        for _ in 0..SIDEBAR_OPEN_SOAK_ITERATIONS {
             let result = open_managed_nvim_source_file_with(&source, true, &file, |_, opened| {
                 calls.set(calls.get() + 1);
                 assert_eq!(opened, file);
@@ -2688,14 +2691,14 @@ mod tests {
             });
             assert_eq!(result, FileOpenDelivery::Opened);
         }
-        assert_eq!(calls.get(), 100);
+        assert_eq!(calls.get(), SIDEBAR_OPEN_SOAK_ITERATIONS);
 
         let result = open_managed_nvim_source_file_with(&source, false, &file, |_, _| {
             calls.set(calls.get() + 1);
             Ok(())
         });
         assert_eq!(result, FileOpenDelivery::Unavailable);
-        assert_eq!(calls.get(), 100);
+        assert_eq!(calls.get(), SIDEBAR_OPEN_SOAK_ITERATIONS);
         source.cleanup();
     }
 

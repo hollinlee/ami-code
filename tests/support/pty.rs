@@ -282,5 +282,11 @@ mod tests {
         }
         assert_eq!(raw.len(), RAW_TRANSCRIPT_LIMIT);
         assert!(raw.ends_with(&vec![255; 4096]));
+
+        let oversized = (0..RAW_TRANSCRIPT_LIMIT + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        retain_raw_tail(&mut raw, &oversized);
+        assert_eq!(raw, oversized[17..]);
     }
 }

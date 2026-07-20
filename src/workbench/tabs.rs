@@ -159,6 +159,8 @@ pub fn shell_tab_hit_test(
 mod tests {
     use super::*;
 
+    const LAST_TAB_REPLACEMENT_SOAK_ITERATIONS: u64 = 100;
+
     #[test]
     fn close_active_prefers_right_then_previous_and_inactive_preserves_active() {
         let three_tabs = || {
@@ -217,7 +219,7 @@ mod tests {
     fn one_hundred_last_tab_replacements_never_reuse_identity() {
         let mut tabs = ShellTabs::default();
         let mut previous = tabs.active();
-        for _ in 0..100 {
+        for _ in 0..LAST_TAB_REPLACEMENT_SOAK_ITERATIONS {
             let (_, replacement) = tabs.close(previous).unwrap();
             let replacement = replacement.expect("closing the last tab creates a replacement");
             assert!(replacement > previous);
@@ -227,8 +229,14 @@ mod tests {
             assert_eq!(geometry[0].display_number, 1);
             previous = replacement;
         }
-        assert_eq!(previous, ShellTabId(101));
-        assert_eq!(tabs.new_tab(), ShellTabId(102));
+        assert_eq!(
+            previous,
+            ShellTabId(LAST_TAB_REPLACEMENT_SOAK_ITERATIONS + 1)
+        );
+        assert_eq!(
+            tabs.new_tab(),
+            ShellTabId(LAST_TAB_REPLACEMENT_SOAK_ITERATIONS + 2)
+        );
     }
 
     #[test]

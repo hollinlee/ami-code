@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 mod support;
 
 use std::fs;
@@ -156,7 +158,6 @@ fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .rposition(|window| window == needle)
 }
 
-#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
@@ -164,9 +165,4 @@ fn process_exists(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
-    false
 }
