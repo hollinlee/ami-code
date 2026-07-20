@@ -23,10 +23,11 @@ use crate::backend::{
 };
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
-    ShellTerminalPaneView, SidebarStyle, SidebarTrustChrome, SidebarTrustTarget, TerminalPaneStyle,
-    render_compact_workbench, render_layout_controls, render_shell_terminal_pane, render_sidebar,
-    render_terminal_pane, render_unavailable_terminal_pane, shell_terminal_content_size,
-    sidebar_trust_hit, sidebar_trust_rows, terminal_content_size,
+    ContextMenu, ContextMenuAction, ShellTerminalPaneView, SidebarStyle, SidebarTrustChrome,
+    SidebarTrustTarget, TerminalPaneStyle, render_compact_workbench, render_context_menu,
+    render_layout_controls, render_shell_terminal_pane, render_sidebar, render_terminal_pane,
+    render_unavailable_terminal_pane, shell_terminal_content_size, sidebar_trust_hit,
+    sidebar_trust_rows, terminal_content_size,
 };
 use crate::workbench::{
     LayoutDivider, LayoutHandle, LayoutStore, MIN_SHELL_PANE_HEIGHT, MIN_TERMINAL_HEIGHT,
@@ -74,6 +75,19 @@ struct PendingMouseGesture {
     dragging: bool,
     moved: bool,
     next_edge_scroll: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuKeyAction {
+    Copy,
+    Paste,
+    Dismiss,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContextMenuState {
+    menu: ContextMenu,
+    pane: PaneId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -760,6 +774,7 @@ struct AppRuntime {
     viewport_area: Rect,
     pending_mouse: Option<PendingMouseGesture>,
     pending_layout: Option<PendingLayoutGesture>,
+    context_menu: Option<ContextMenuState>,
     layout_store: Option<LayoutStore>,
     trust_store: Option<WorkspaceTrustStore>,
     trust_state: WorkspaceTrustState,
@@ -862,6 +877,7 @@ impl AppRuntime {
             viewport_area: area,
             pending_mouse: None,
             pending_layout: None,
+            context_menu: None,
             layout_store,
             trust_store,
             trust_state,
@@ -905,6 +921,7 @@ impl AppRuntime {
     fn shutdown(&mut self) {
         self.pending_mouse = None;
         self.cancel_layout_gesture();
+        self.context_menu = None;
         self.sessions.shutdown();
     }
 
@@ -920,6 +937,7 @@ impl AppRuntime {
         let now = Instant::now();
         if self.viewport_area != area {
             self.cancel_layout_gesture();
+            self.context_menu = None;
             self.viewport_area = area;
         }
         if self.launch_mode.is_workbench() {
@@ -932,6 +950,7 @@ impl AppRuntime {
             );
             if self.layout != Some(layout) {
                 self.pending_mouse = None;
+                self.context_menu = None;
                 if clear_selection {
                     self.clear_selection();
                 }
@@ -1036,6 +1055,9 @@ impl AppRuntime {
             }
         }
         render_layout_controls(frame, layout);
+        if let Some(context_menu) = self.context_menu {
+            render_context_menu(frame, context_menu.menu);
+        }
     }
 
     fn render_slot(
@@ -1115,8 +1137,21 @@ impl AppRuntime {
                 self.pending_mouse = None;
                 self.cancel_layout_gesture();
                 if is_quit(key) {
+                    self.context_menu = None;
                     self.shutdown();
                     return Ok(false);
+                }
+                if let Some(context) = self.context_menu.take() {
+                    let copy_enabled = context_menu_copy_enabled(&self.workbench, context.pane);
+                    match context_menu_key_action(key, copy_enabled) {
+                        ContextMenuKeyAction::Copy => self.copy_selection(),
+                        ContextMenuKeyAction::Paste => {
+                            self.clear_selection();
+                            self.paste_system_clipboard()?;
+                        }
+                        ContextMenuKeyAction::Dismiss => {}
+                    }
+                    return Ok(true);
                 }
                 if should_copy_selection(key, self.workbench.selection().is_some()) {
                     self.copy_selection();
@@ -1145,6 +1180,7 @@ impl AppRuntime {
             Event::Paste(contents) => {
                 self.pending_mouse = None;
                 self.cancel_layout_gesture();
+                self.context_menu = None;
                 self.clear_selection();
                 self.paste_into_focused(&contents)?;
             }
@@ -1190,6 +1226,44 @@ impl AppRuntime {
         let Some(layout) = self.layout else {
             return Ok(());
         };
+        if let Some(context) = self.context_menu {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.context_menu = None;
+                match context.menu.action_at(event.column, event.row) {
+                    Some(ContextMenuAction::Copy) => self.copy_selection(),
+                    Some(ContextMenuAction::Paste) => {
+                        self.workbench.focus_pane(context.pane);
+                        self.clear_selection();
+                        self.paste_system_clipboard()?;
+                    }
+                    None => {}
+                }
+                return Ok(());
+            }
+            if event.kind != MouseEventKind::Down(MouseButton::Right) {
+                return Ok(());
+            }
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Right) {
+            self.pending_mouse = None;
+            self.cancel_layout_gesture();
+            self.context_menu = None;
+            if let Some(MouseTarget::Content { pane, .. }) =
+                hit_test(layout, event.column, event.row)
+            {
+                self.workbench.focus_pane(pane);
+                self.context_menu = Some(ContextMenuState {
+                    menu: ContextMenu::new(
+                        self.viewport_area,
+                        event.column,
+                        event.row,
+                        context_menu_copy_enabled(&self.workbench, pane),
+                    ),
+                    pane,
+                });
+            }
+            return Ok(());
+        }
         // The complete tab row is frontend chrome. Consume even overflow/blank
         // cells so no gesture can focus, select, paste into, or reach a PTY.
         if layout.bottom.height > 0
@@ -2021,6 +2095,23 @@ fn truncate(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn context_menu_key_action(key: KeyEvent, copy_enabled: bool) -> ContextMenuKeyAction {
+    if copy_enabled && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER)
+    {
+        ContextMenuKeyAction::Copy
+    } else if is_system_paste(key) {
+        ContextMenuKeyAction::Paste
+    } else {
+        ContextMenuKeyAction::Dismiss
+    }
+}
+
+fn context_menu_copy_enabled(workbench: &WorkbenchState, pane: PaneId) -> bool {
+    workbench
+        .selection()
+        .is_some_and(|selection| selection.pane() == pane)
+}
+
 fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
@@ -2262,6 +2353,49 @@ mod tests {
             "  shell"
         );
         assert!(!session_title("shell", None, 20).contains("Ctrl+Q"));
+    }
+
+    #[test]
+    fn context_menu_keys_are_consumed_and_copy_is_pane_owned() {
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);
+        let control_copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let ordinary = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            context_menu_key_action(copy, true),
+            ContextMenuKeyAction::Copy
+        );
+        assert_eq!(
+            context_menu_key_action(copy, false),
+            ContextMenuKeyAction::Dismiss
+        );
+        assert_eq!(
+            context_menu_key_action(control_copy, true),
+            ContextMenuKeyAction::Dismiss
+        );
+        assert_eq!(
+            context_menu_key_action(paste, false),
+            ContextMenuKeyAction::Paste
+        );
+        assert_eq!(
+            context_menu_key_action(escape, true),
+            ContextMenuKeyAction::Dismiss
+        );
+        assert_eq!(
+            context_menu_key_action(ordinary, true),
+            ContextMenuKeyAction::Dismiss
+        );
+
+        let mut workbench = WorkbenchState::default();
+        workbench.begin_selection(crate::terminal::TerminalPoint::new(0, 0));
+        assert!(context_menu_copy_enabled(&workbench, PaneId::Editor));
+        let agent_copy_enabled = context_menu_copy_enabled(&workbench, PaneId::Agent);
+        assert!(!agent_copy_enabled);
+        assert_eq!(
+            context_menu_key_action(copy, agent_copy_enabled),
+            ContextMenuKeyAction::Dismiss
+        );
     }
 
     #[test]

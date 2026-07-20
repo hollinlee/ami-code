@@ -50,6 +50,10 @@ impl PtyHarness {
         command.env("PI_SKIP_VERSION_CHECK", "1");
         command.env("PI_TELEMETRY", "0");
         command.env("AMI_CODE_TEST_CHILD_PID", fixture.path().join("child.pid"));
+        command.env(
+            "AMI_CODE_TEST_CHILD_INPUT",
+            fixture.path().join("child-input"),
+        );
 
         let child = pair
             .slave
@@ -156,6 +160,10 @@ impl PtyHarness {
         self.fixture.path().join("child.pid")
     }
 
+    pub fn child_input_path(&self) -> PathBuf {
+        self.fixture.path().join("child-input")
+    }
+
     fn consume(&mut self, bytes: Vec<u8>) {
         self.parser.process(&bytes);
         retain_raw_tail(&mut self.raw, &bytes);
@@ -249,7 +257,7 @@ fn create_fixture_shell(root: &Path) -> PathBuf {
     let path = root.join("fixture-shell");
     fs::write(
         &path,
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$AMI_CODE_TEST_CHILD_PID\"\ntrap 'exit 0' HUP INT TERM\nwhile IFS= read -r line; do :; done\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$AMI_CODE_TEST_CHILD_PID\"\ntrap 'exit 0' HUP INT TERM\nwhile IFS= read -r line; do printf '<%s>\\n' \"$line\" >> \"$AMI_CODE_TEST_CHILD_INPUT\"; done\n",
     )
     .expect("write fixture shell");
     #[cfg(unix)]

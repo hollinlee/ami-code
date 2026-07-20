@@ -5,6 +5,11 @@ pub const MIN_TERMINAL_WIDTH: u16 = 4;
 pub const MIN_TERMINAL_HEIGHT: u16 = 4;
 /// Bordered Shell plus one tab-strip row and two parser-safe content rows.
 pub const MIN_SHELL_PANE_HEIGHT: u16 = 5;
+/// Responsive breakpoints preserve useful backend geometry before sacrificing
+/// secondary workspace chrome.
+pub const PREFERRED_MAIN_WIDTH: u16 = 80;
+pub const PREFERRED_AGENT_WIDTH: u16 = 25;
+pub const PREFERRED_EDITOR_HEIGHT: u16 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkbenchLayoutConfig {
@@ -27,12 +32,16 @@ impl Default for WorkbenchLayoutConfig {
 
 impl WorkbenchLayoutConfig {
     pub fn sidebar_shortage_width(self) -> u16 {
-        self.sidebar_width
-            .saturating_add(MIN_TERMINAL_WIDTH.saturating_mul(2))
+        let preferred_main = self
+            .editor_width
+            .map(|editor| editor.saturating_add(PREFERRED_AGENT_WIDTH))
+            .unwrap_or(PREFERRED_MAIN_WIDTH)
+            .max(PREFERRED_MAIN_WIDTH);
+        self.sidebar_width.saturating_add(preferred_main)
     }
 
     pub fn bottom_shortage_height(self) -> u16 {
-        self.bottom_height.saturating_add(MIN_TERMINAL_HEIGHT)
+        self.bottom_height.saturating_add(PREFERRED_EDITOR_HEIGHT)
     }
 }
 
@@ -141,6 +150,19 @@ impl WorkbenchLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responsive_breakpoints_preserve_useful_backend_geometry() {
+        let default = WorkbenchLayoutConfig::default();
+        assert_eq!(default.sidebar_shortage_width(), 104);
+        assert_eq!(default.bottom_shortage_height(), 24);
+
+        let manual = WorkbenchLayoutConfig {
+            editor_width: Some(63),
+            ..default
+        };
+        assert_eq!(manual.sidebar_shortage_width(), 112);
+    }
 
     #[test]
     fn uses_55_45_post_sidebar_geometry() {
