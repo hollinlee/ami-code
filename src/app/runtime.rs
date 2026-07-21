@@ -18,7 +18,7 @@ use ratatui::layout::Rect;
 use super::LaunchMode;
 use super::supervisor::{RestartDecision, RestartPolicy, SessionIdentity, SessionIds};
 use crate::backend::{
-    BackendKind, BackendSpec, ManagedNvimGeneration, ManagedNvimProfile, ManagedPiProfile,
+    BackendKind, BackendSpec, ManagedNvimGeneration, ManagedNvimProfile, NativePiProfile,
     NvimController, ShellBackend,
 };
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
@@ -143,32 +143,28 @@ enum ProcessSource {
         current: Option<ManagedNvimGeneration>,
         controller: NvimController,
     },
-    ManagedPi {
+    NativePi {
         workspace: Workspace,
-        materialization: ManagedPiMaterialization,
+        location: NativePiLocation,
         trust_store: Option<WorkspaceTrustStore>,
     },
 }
 
 #[derive(Clone)]
-enum ManagedPiMaterialization {
+enum NativePiLocation {
     Environment,
     #[cfg(test)]
     Explicit {
         state_root: std::path::PathBuf,
-        auth_source: std::path::PathBuf,
     },
 }
 
-impl ManagedPiMaterialization {
-    fn profile(&self) -> Result<ManagedPiProfile> {
+impl NativePiLocation {
+    fn profile(&self) -> Result<NativePiProfile> {
         match self {
-            Self::Environment => ManagedPiProfile::from_environment(),
+            Self::Environment => NativePiProfile::from_environment(),
             #[cfg(test)]
-            Self::Explicit {
-                state_root,
-                auth_source,
-            } => ManagedPiProfile::materialize(state_root, auth_source),
+            Self::Explicit { state_root } => NativePiProfile::new(state_root),
         }
     }
 }
@@ -178,7 +174,7 @@ impl ProcessSource {
         match self {
             Self::Static(spec) => &spec.display_name,
             Self::ManagedNvim { .. } => "nvim",
-            Self::ManagedPi { .. } => "pi",
+            Self::NativePi { .. } => "pi",
         }
     }
 
@@ -200,16 +196,16 @@ impl ProcessSource {
                 *current = Some(generation);
                 Ok(spec)
             }
-            Self::ManagedPi {
+            Self::NativePi {
                 workspace,
-                materialization,
+                location,
                 trust_store,
             } => {
                 let trust = trust_store
                     .as_ref()
                     .and_then(|store| store.resolve().ok())
                     .unwrap_or(WorkspaceTrustState::Untrusted);
-                materialization
+                location
                     .profile()?
                     .process_spec_with_trust(workspace, trust)
             }
@@ -265,7 +261,7 @@ impl SessionRegistry {
                 workspace,
             )),
             LaunchMode::Nvim => managed_nvim_source(workspace)?,
-            LaunchMode::Pi => managed_pi_source(workspace, trust_store),
+            LaunchMode::Pi => native_pi_source(workspace, trust_store),
             LaunchMode::Workbench => unreachable!("workbench uses multiple slots"),
         };
         Ok(Self::from_sources(
@@ -298,7 +294,7 @@ impl SessionRegistry {
                 ),
                 (
                     SessionKey::Pane(PaneId::Agent),
-                    managed_pi_source(workspace, trust_store),
+                    native_pi_source(workspace, trust_store),
                     terminal_content_size(layout.agent),
                 ),
                 (
@@ -335,7 +331,7 @@ impl SessionRegistry {
                     let spec = match &source {
                         ProcessSource::Static(spec) => spec.clone(),
                         ProcessSource::ManagedNvim { .. } => ProcessSpec::new("nvim"),
-                        ProcessSource::ManagedPi { .. } => ProcessSpec::new("pi"),
+                        ProcessSource::NativePi { .. } => ProcessSpec::new("pi"),
                     };
                     (
                         key,
@@ -1835,13 +1831,13 @@ fn apply_sidebar_open_result(
     }
 }
 
-fn managed_pi_source(
+fn native_pi_source(
     workspace: &Workspace,
     trust_store: Option<WorkspaceTrustStore>,
 ) -> ProcessSource {
-    ProcessSource::ManagedPi {
+    ProcessSource::NativePi {
         workspace: workspace.clone(),
-        materialization: ManagedPiMaterialization::Environment,
+        location: NativePiLocation::Environment,
         trust_store,
     }
 }
@@ -2598,14 +2594,14 @@ mod tests {
             ProcessSource::ManagedNvim { controller, .. } => {
                 controller.endpoint().unwrap().to_path_buf()
             }
-            ProcessSource::Static(_) | ProcessSource::ManagedPi { .. } => unreachable!(),
+            ProcessSource::Static(_) | ProcessSource::NativePi { .. } => unreachable!(),
         };
         source.next_spec().unwrap();
         let second = match &source {
             ProcessSource::ManagedNvim { controller, .. } => {
                 controller.endpoint().unwrap().to_path_buf()
             }
-            ProcessSource::Static(_) | ProcessSource::ManagedPi { .. } => unreachable!(),
+            ProcessSource::Static(_) | ProcessSource::NativePi { .. } => unreachable!(),
         };
         assert_ne!(first, second);
         assert!(!first.exists());
@@ -2614,7 +2610,7 @@ mod tests {
             ProcessSource::ManagedNvim { controller, .. } => {
                 controller.remote_open_spec("replacement.txt").unwrap()
             }
-            ProcessSource::Static(_) | ProcessSource::ManagedPi { .. } => unreachable!(),
+            ProcessSource::Static(_) | ProcessSource::NativePi { .. } => unreachable!(),
         };
         assert_eq!(remote.args[1], second.to_string_lossy());
         source.cleanup();
@@ -2844,31 +2840,24 @@ mod tests {
     }
 
     #[test]
-    fn managed_pi_generation_resolves_trust_each_time_and_stale_is_locked_down() {
+    fn native_pi_generation_resolves_trust_each_time_and_keeps_global_resources() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace_path = temp.path().join("workspace");
-        let auth_dir = temp.path().join("auth");
         std::fs::create_dir(&workspace_path).unwrap();
-        std::fs::create_dir(&auth_dir).unwrap();
-        let auth = auth_dir.join("auth.json");
-        std::fs::write(&auth, b"{}\n").unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&auth, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .unwrap();
         let workspace = Workspace::discover(&workspace_path).unwrap();
         let store =
             WorkspaceTrustStore::new(&workspace_path, temp.path().join("trust-state")).unwrap();
-        let mut source = ProcessSource::ManagedPi {
+        let mut source = ProcessSource::NativePi {
             workspace,
-            materialization: ManagedPiMaterialization::Explicit {
+            location: NativePiLocation::Explicit {
                 state_root: temp.path().join("pi-state"),
-                auth_source: auth,
             },
             trust_store: Some(store.clone()),
         };
 
         let first = source.next_spec().unwrap();
         assert!(first.args.iter().any(|arg| arg == "--no-approve"));
+        assert!(!first.args.iter().any(|arg| arg == "--no-extensions"));
         store.trust().unwrap();
         let trusted = source.next_spec().unwrap();
         assert!(trusted.args.iter().any(|arg| arg == "--approve"));
@@ -2879,7 +2868,7 @@ mod tests {
         std::fs::create_dir(&workspace_path).unwrap();
         let stale = source.next_spec().unwrap();
         assert!(stale.args.iter().any(|arg| arg == "--no-approve"));
-        assert!(stale.args.iter().any(|arg| arg == "--no-extensions"));
+        assert!(!stale.args.iter().any(|arg| arg == "--no-extensions"));
     }
 
     #[test]
@@ -2899,30 +2888,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_pi_preparation_failure_is_lazy_and_retryable() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn native_pi_session_preparation_failure_is_lazy_and_retryable() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace_dir = temp.path().join("workspace");
-        let auth_dir = temp.path().join("shared");
         std::fs::create_dir(&workspace_dir).unwrap();
-        std::fs::create_dir(&auth_dir).unwrap();
-        let auth = auth_dir.join("auth.json");
-        std::fs::write(&auth, b"RETRY-SECRET-MARKER").unwrap();
-        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o640)).unwrap();
         let workspace = Workspace::discover(workspace_dir).unwrap();
-        let mut source = ProcessSource::ManagedPi {
+        let state_root = temp.path().join("state");
+        let profile = NativePiProfile::new(&state_root).unwrap();
+        let session_dir = profile.session_dir(&workspace).unwrap();
+        std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+        std::fs::write(&session_dir, b"not a directory").unwrap();
+        let mut source = ProcessSource::NativePi {
             workspace,
-            materialization: ManagedPiMaterialization::Explicit {
-                state_root: temp.path().join("state"),
-                auth_source: auth.clone(),
-            },
+            location: NativePiLocation::Explicit { state_root },
             trust_store: None,
         };
 
-        let error = source.next_spec().unwrap_err();
-        assert!(!format!("{error:?}").contains("RETRY-SECRET-MARKER"));
-        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(source.next_spec().is_err());
+        std::fs::remove_file(session_dir).unwrap();
         let spec = source.next_spec().unwrap();
         assert_eq!(spec.display_name, "pi");
     }
