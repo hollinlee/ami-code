@@ -4,7 +4,7 @@ mod shell;
 
 #[allow(unused_imports)]
 pub use crate::workspace::WorkspaceTrustState as ProjectTrustMode;
-pub use agent::ManagedPiProfile;
+pub use agent::NativePiProfile;
 #[allow(unused_imports)]
 pub use editor::{
     ManagedNvimGeneration, ManagedNvimProfile, NvimBackend, NvimController, NvimRemoteError,
