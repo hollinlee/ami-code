@@ -13,6 +13,13 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 64;
 const DRAIN_CHUNK_BUDGET: usize = 64;
 const RAW_TRANSCRIPT_LIMIT: usize = 256 * 1024;
 
+#[derive(Debug, Default)]
+pub struct PtyHarnessOptions {
+    pub pi_coding_agent_dir: Option<PathBuf>,
+    pub pi_exit_immediately: bool,
+    pub nvim_fixture: bool,
+}
+
 pub struct PtyHarness {
     master: Box<dyn MasterPty + Send>,
     writer: Option<Box<dyn Write + Send>>,
@@ -26,13 +33,28 @@ pub struct PtyHarness {
 
 impl PtyHarness {
     pub fn spawn(args: &[&str], cols: u16, rows: u16) -> Self {
+        Self::spawn_with_options(args, cols, rows, PtyHarnessOptions::default())
+    }
+
+    pub fn spawn_with_options(
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        options: PtyHarnessOptions,
+    ) -> Self {
         let fixture = TempDir::new().expect("create PTY fixture");
         let workspace = fixture.path().join("workspace");
         let home = fixture.path().join("home");
         let state = fixture.path().join("state");
+        let fixture_bin = fixture.path().join("bin");
         fs::create_dir_all(&workspace).expect("create workspace");
         fs::create_dir_all(&home).expect("create HOME");
+        fs::create_dir_all(&fixture_bin).expect("create fixture bin");
         let shell = create_fixture_shell(fixture.path());
+        if options.nvim_fixture {
+            create_fixture_nvim(&fixture_bin);
+        }
+        create_fixture_pi(&fixture_bin);
 
         let pair = native_pty_system()
             .openpty(pty_size(cols, rows))
@@ -44,7 +66,10 @@ impl PtyHarness {
         command.env("HOME", &home);
         command.env("AMI_CODE_STATE_DIR", &state);
         command.env("SHELL", &shell);
-        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        command.env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fixture_bin.display()),
+        );
         command.env("TERM", "xterm-256color");
         command.env("LC_ALL", "C");
         command.env("PI_SKIP_VERSION_CHECK", "1");
@@ -54,6 +79,16 @@ impl PtyHarness {
             "AMI_CODE_TEST_CHILD_INPUT",
             fixture.path().join("child-input"),
         );
+        command.env("AMI_CODE_TEST_PI_ARGS", fixture.path().join("pi-args"));
+        command.env("AMI_CODE_TEST_PI_ENV", fixture.path().join("pi-env"));
+        command.env("AMI_CODE_TEST_PI_PIDS", fixture.path().join("pi-pids"));
+        command.env("AMI_CODE_TEST_NVIM_PIDS", fixture.path().join("nvim-pids"));
+        if let Some(agent_dir) = options.pi_coding_agent_dir {
+            command.env("PI_CODING_AGENT_DIR", agent_dir);
+        }
+        if options.pi_exit_immediately {
+            command.env("AMI_CODE_TEST_PI_EXIT_IMMEDIATELY", "1");
+        }
 
         let child = pair
             .slave
@@ -164,6 +199,26 @@ impl PtyHarness {
         self.fixture.path().join("child-input")
     }
 
+    pub fn pi_args_path(&self) -> PathBuf {
+        self.fixture.path().join("pi-args")
+    }
+
+    pub fn pi_env_path(&self) -> PathBuf {
+        self.fixture.path().join("pi-env")
+    }
+
+    pub fn pi_pids_path(&self) -> PathBuf {
+        self.fixture.path().join("pi-pids")
+    }
+
+    pub fn nvim_pids_path(&self) -> PathBuf {
+        self.fixture.path().join("nvim-pids")
+    }
+
+    pub fn state_path(&self) -> PathBuf {
+        self.fixture.path().join("state")
+    }
+
     fn consume(&mut self, bytes: Vec<u8>) {
         self.parser.process(&bytes);
         retain_raw_tail(&mut self.raw, &bytes);
@@ -251,6 +306,38 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
         pixel_width: 0,
         pixel_height: 0,
     }
+}
+
+fn create_fixture_nvim(bin: &Path) -> PathBuf {
+    let path = bin.join("nvim");
+    fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$AMI_CODE_TEST_NVIM_PIDS\"\nprintf 'fixture nvim ready\\n'\ntrap 'exit 0' HUP INT TERM\nwhile IFS= read -r line; do :; done\n",
+    )
+    .expect("write fixture nvim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make fixture nvim executable");
+    }
+    path
+}
+
+fn create_fixture_pi(bin: &Path) -> PathBuf {
+    let path = bin.join("pi");
+    fs::write(
+        &path,
+        "#!/bin/sh\n{\n  printf 'start\\n'\n  for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n} >> \"$AMI_CODE_TEST_PI_ARGS\"\nif [ \"${PI_CODING_AGENT_DIR+x}\" = x ]; then\n  printf 'set=%s\\n' \"$PI_CODING_AGENT_DIR\" >> \"$AMI_CODE_TEST_PI_ENV\"\nelse\n  printf 'unset\\n' >> \"$AMI_CODE_TEST_PI_ENV\"\nfi\nprintf '%s\\n' \"$$\" >> \"$AMI_CODE_TEST_PI_PIDS\"\nprintf 'fixture pi ready\\n'\nif [ \"${AMI_CODE_TEST_PI_EXIT_IMMEDIATELY:-0}\" = 1 ]; then exit 42; fi\ntrap 'exit 0' HUP INT TERM\nwhile IFS= read -r line; do :; done\n",
+    )
+    .expect("write fixture pi");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make fixture pi executable");
+    }
+    path
 }
 
 fn create_fixture_shell(root: &Path) -> PathBuf {
